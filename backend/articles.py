@@ -677,9 +677,9 @@ def _sync_history_from_disk(history: list) -> bool:
                     if not art_dir.is_dir():
                         continue
 
-                    # 检查目录下是否存在 html 文件
-                    html_files = [f for f in art_dir.glob("*.html") if not f.name.endswith("_raw.html")]
-                    if not html_files:
+                    # Export selection may omit HTML entirely.
+                    exports = [f for f in art_dir.iterdir() if f.suffix in (".html", ".md", ".pdf", ".txt")]
+                    if not exports:
                         # 检查是否为失败下载遗留的空目录（仅有空 media 目录等），如果是则安全清理
                         try:
                             has_files = any(f.is_file() for f in art_dir.rglob("*"))
@@ -701,6 +701,8 @@ def _sync_history_from_disk(history: list) -> bool:
                         except Exception:
                             meta = {}
 
+                    if meta.get("export_errors"):
+                        continue
                     try:
                         link = meta.get("url", "")
                         mtime = art_dir.stat().st_mtime
@@ -724,7 +726,7 @@ def _sync_history_from_disk(history: list) -> bool:
                             "path": art_path_str,
                             "cover_url": meta.get("cover_url", ""),
                             "digest": meta.get("digest", ""),
-                            "publish_time": meta.get("publish_time") or int(time_val),
+                            "publish_time": meta.get("publish_time", int(time_val)),
                             "has_markdown": has_md,
                             "has_pdf": has_pdf,
                         }
@@ -1422,9 +1424,10 @@ def serve_file(filepath=""):
                 if c.stem == d.name:
                     return c
             return candidates[0]
-        all_html = list(d.glob("*.html"))
-        if all_html:
-            return all_html[0]
+        for suffix in (".pdf", ".md", ".txt", ".html"):
+            files = sorted(d.glob(f"*{suffix}"))
+            if files:
+                return files[0]
         return None
 
     target_path = None
@@ -1502,6 +1505,8 @@ def serve_file(filepath=""):
     if not is_safe_path(target_path):
         return "Access denied", 403
 
+    if target_path.suffix in (".md", ".txt"):
+        return send_from_directory(target_path.parent, target_path.name, mimetype="text/plain")
     return send_from_directory(target_path.parent, target_path.name)
 
 

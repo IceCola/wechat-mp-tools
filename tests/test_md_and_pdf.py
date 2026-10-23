@@ -18,7 +18,7 @@ from backend.downloader import (
     download_single_article,
     try_extract_gallery_article,
 )
-from backend.config import get_settings
+from backend.config import get_settings, DEFAULT_SETTINGS
 
 
 class TestMarkdownAndPDF(unittest.TestCase):
@@ -162,7 +162,8 @@ class TestMarkdownAndPDF(unittest.TestCase):
         mock_cdn_client.return_value.get.return_value = mock_response
 
         out_dir = self.test_dir / "download_out"
-        result = download_single_article("https://mp.weixin.qq.com/s/mock_article", out_dir, "端到端下载导出测试")
+        with patch("backend.downloader.get_settings", return_value={**DEFAULT_SETTINGS, "save_pdf": True}):
+            result = download_single_article("https://mp.weixin.qq.com/s/mock_article", out_dir, "端到端下载导出测试")
 
         self.assertTrue(mock_data_client.return_value.get.called, "文章抓取必须走 data client")
         self.assertTrue(result["success"])

@@ -604,10 +604,12 @@ const HistoryPage = {
                             原文链接
                         </button>
                     ` : ''}
-                    ${!isVideo ? `
+                    ${!isVideo && item.has_markdown !== false ? `
                     <button class="btn btn-secondary btn-sm" data-path="${path}" onclick="HistoryPage.openFile(this.dataset.path, 'md')" style="padding: 4px 10px; font-size: 0.78rem;">
                         📝 打开 MD
                     </button>
+                    ` : ''}
+                    ${!isVideo && item.has_pdf !== false ? `
                     <button class="btn btn-secondary btn-sm" data-path="${path}" onclick="HistoryPage.openFile(this.dataset.path, 'pdf')" style="padding: 4px 10px; font-size: 0.78rem;">
                         📕 打开 PDF
                     </button>

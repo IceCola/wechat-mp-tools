@@ -11,14 +11,18 @@ import json
 import shutil
 import subprocess
 import logging
+import base64
+import mimetypes
+import tempfile
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs, quote, unquote
 from html import unescape
 from html.parser import HTMLParser
+from bs4 import BeautifulSoup
 
 from backend.config import (
-    DEFAULT_HEADERS, get_proxies_dict, get_settings, report_proxy_status
+    DEFAULT_HEADERS, get_proxies_dict, get_settings, report_proxy_status, validate_download_settings
 )
 from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
 from backend.avatar_cache import extract_account_avatar, extract_avatar_account_id
@@ -635,6 +639,17 @@ def find_mmbiz_urls(html: str) -> set:
     return urls
 
 
+def activate_lazy_images(html: str) -> str:
+    """Use each image's real source without duplicate src or remote srcset."""
+    soup = BeautifulSoup(html, "html.parser")
+    for image in soup.find_all("img"):
+        if image.get("data-src"):
+            image["src"] = image.attrs.pop("data-src")
+        image.attrs.pop("srcset", None)
+        image.attrs.pop("data-srcset", None)
+    return str(soup)
+
+
 def replace_variants(html: str, orig: str, local: str) -> str:
     """替换 HTML 中的远程 URL 为本地路径"""
     out = html
@@ -1054,20 +1069,20 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     """
     MAX_REDIRECT_DEPTH = 3
     settings = get_settings()
-    save_images = settings.get("auto_save_images", True)
-    save_videos = settings.get("auto_save_videos", True)
+    validate_download_settings(settings)
+    image_mode = settings.get("image_mode", "local")
+    needs_media = any(settings.get(key, default) for key, default in
+                      (("save_html", True), ("save_markdown", True), ("save_pdf", False)))
+    save_images = settings.get("auto_save_images", True) and needs_media
+    save_videos = settings.get("auto_save_videos", True) and needs_media
 
     safe_title = sanitize(title_hint) if title_hint else "article"
-    art_dir = out_dir / safe_title
-
     clean_url = clean_wechat_article_url(url)
     proxies = get_proxies_dict()
     proxy_url = proxies.get("http") if proxies else None
 
     raw_html, final_url, fetch_error = fetch_wechat_article_html(clean_url, review_id=review_id)
     if not raw_html:
-        if art_dir.exists():
-            shutil.rmtree(art_dir, ignore_errors=True)
         return {"success": False, "title": safe_title, "error": fetch_error or "获取页面失败", "is_permanent": False}
 
     # 检测是否为微信屏蔽、删除或出错页面（贴图画廊类型可能不含 js_content/js_article，但含有 picture_page_info_list）
@@ -1117,8 +1132,6 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
             is_permanent = False
 
     if is_error:
-        if art_dir.exists():
-            shutil.rmtree(art_dir, ignore_errors=True)
         report_proxy_status(proxy_url, success=False)
         return {"success": False, "title": safe_title, "error": error_msg, "is_permanent": is_permanent}
 
@@ -1132,8 +1145,6 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         if content_is_empty and _redirect_depth < MAX_REDIRECT_DEPTH:
             original_url = unescape(share_source_match.group(1))
             original_url = clean_wechat_article_url(original_url)
-            if art_dir.exists():
-                shutil.rmtree(art_dir, ignore_errors=True)
             return download_single_article(original_url, out_dir, title_hint, _redirect_depth=_redirect_depth + 1)
 
     # 提取封面 URL、描述和发布时间
@@ -1164,7 +1175,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         for k, v in replacements.items():
             digest = digest.replace(k, v)
 
-    publish_time = int(datetime.now(timezone.utc).timestamp())
+    publish_time = 0
     # 提取微信文章中的发布时间戳 ct
     ct_match = re.search(r'\bct\s*=\s*["\']?(\d+)["\']?', raw_html)
     if ct_match:
@@ -1193,22 +1204,37 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     if page_title:
         safe_title = sanitize(page_title)
 
-    art_dir = out_dir / safe_title
-    if art_dir.exists() and any(art_dir.glob("*.html")):
-        counter = 1
-        while (out_dir / f"{safe_title}_{counter}").exists() and any((out_dir / f"{safe_title}_{counter}").glob("*.html")):
+    basename = safe_title
+    if settings.get("filename_date", False) and publish_time > 0:
+        date = datetime.fromtimestamp(publish_time, timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        basename = f"{date}_{safe_title}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    art_dir = out_dir / basename
+    counter = 0
+    while True:
+        try:
+            art_dir.mkdir()
+            break
+        except FileExistsError:
             counter += 1
-        art_dir = out_dir / f"{safe_title}_{counter}"
+            art_dir = out_dir / f"{basename}_{counter}"
 
     media_dir = art_dir / "media"
-    media_dir.mkdir(parents=True, exist_ok=True)
+
+    def image_reference(filename):
+        image_path = media_dir / filename
+        if image_mode == "embedded":
+            mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+            image_path.unlink()
+            return f"data:{mime};base64,{encoded}"
+        return f"media/{filename}"
 
     # 提取正文区域
     content_html = extract_article_content(raw_html)
 
     # 内容过滤：屏蔽广告块、二维码、以及被当作小节标题的横幅图片。
-    # 只影响「清洗后」的产物（.html / content.txt / .md / PDF），
-    # _raw.html 与 data.json 仍保留原始正文，方便回头重跑。
+    # 只影响清洗后的导出；data.json 与可选的 _raw.html 保留原始正文。
     try:
         from backend.content_filter import filter_article_html
 
@@ -1231,13 +1257,14 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
             cover_filename = f"cover.{cover_ext}"
             real_cover = download_resource(cover_url, media_dir / cover_filename)
             if real_cover:
-                url_map[cover_url] = f"media/{real_cover}"
+                url_map[cover_url] = image_reference(real_cover)
 
-        # 仅在文章正文 content_html 内提取图片，避免下载外部页眉、页脚、微信小图标等多余资源
-        for m in re.finditer(r'data-src="([^"]*mmbiz[^"]*)"', content_html):
-            img_urls.add(normalize_url(m.group(1)))
-        for m in re.finditer(r'src="([^"]*mmbiz[^"]*)"', content_html):
-            img_urls.add(normalize_url(m.group(1)))
+        # Read real lazy-load sources instead of placeholder src attributes.
+        for image in BeautifulSoup(filtered_html, "html.parser").find_all("img"):
+            src = image.get("data-src") or image.get("src") or ""
+            src = normalize_url(src)
+            if src.startswith(("http://", "https://")):
+                img_urls.add(src)
 
         video_covers = {normalize_url(v["cover"]) for v in video_iframes if v.get("cover")}
         img_urls = {u for u in img_urls if u not in video_covers}
@@ -1249,7 +1276,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
             fname = f"img_{i:03d}.{ext}"
             real_img = download_resource(img_url, media_dir / fname)
             if real_img:
-                url_map[img_url] = f"media/{real_img}"
+                url_map[img_url] = image_reference(real_img)
 
     # 下载视频
     if save_videos:
@@ -1287,8 +1314,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
                     cover_name = f"video_cover_{i}.{cover_ext}"
                     real_cover = download_resource(video["cover"], media_dir / cover_name)
                     if real_cover:
-                        poster_attr = f' poster="media/{real_cover}"'
-                        url_map[video["cover"]] = f"media/{real_cover}"
+                        poster_ref = image_reference(real_cover)
+                        poster_attr = f' poster="{poster_ref}"'
+                        url_map[video["cover"]] = poster_ref
                 url_map[f"__video_iframe__{video.get('vid', i)}"] = (
                     video,
                     f'<video controls src="media/{fname}"{poster_attr}></video>',
@@ -1302,8 +1330,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
             localized = replace_video_iframe(localized, video, video_tag)
         else:
             localized = replace_variants(localized, orig, local)
-    # 同时处理 data-src -> src 替换
-    localized = re.sub(r'data-src="([^"]*)"', r'src="\1"', localized)
+    localized = activate_lazy_images(localized)
 
     # 生成离线 HTML
     full_html = (
@@ -1333,39 +1360,15 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         '</body>\n</html>'
     )
 
-    html_path = art_dir / f"{safe_title}.html"
-    html_path.write_text(full_html, encoding="utf-8")
+    html_path = art_dir / f"{basename}.html"
+    if settings.get("save_html", True):
+        html_path.write_text(full_html, encoding="utf-8")
 
     # 生成并保存原始 HTML (保持外部资源链接不变)
-    raw_localized = content_html
-    raw_localized = re.sub(r'data-src="([^"]*)"', r'src="\1"', raw_localized)
-    raw_full_html = (
-        '<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n'
-        '  <meta charset="UTF-8">\n'
-        '  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-        f'  <title>{safe_title}</title>\n'
-        '  <style>\n'
-        '    @page { margin: 15mm 12mm; size: A4; }\n'
-        '    body { max-width: 720px; margin: 0 auto; padding: 20px;\n'
-        "           font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Hiragino Sans GB', 'Helvetica Neue', sans-serif;\n"
-        '           line-height: 1.8; color: #333; word-break: break-word; }\n'
-        '    img, video { max-width: 100%; height: auto; display: block; margin: 14px auto;\n'
-        '                 page-break-inside: avoid; break-inside: avoid; border-radius: 4px; }\n'
-        '    h1, h2, h3, h4, h5, h6 { page-break-after: avoid; break-after: avoid; color: #111; }\n'
-        '    h1 { font-size: 24px; margin-bottom: 16px; }\n'
-        '    blockquote { margin: 14px 0; padding: 10px 16px; background: #f8f9fa; border-left: 4px solid #07c160; color: #555; }\n'
-        '    table { width: 100%; border-collapse: collapse; margin: 15px 0; }\n'
-        '    th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }\n'
-        '    th { background-color: #f2f2f2; font-weight: 600; }\n'
-        '    code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; background-color: #f6f8fa; border-radius: 4px; }\n'
-        '    pre { padding: 12px; overflow-x: auto; line-height: 1.5; }\n'
-        '    #js_content, .rich_media_content { visibility: visible !important; }\n'
-        '  </style>\n</head>\n<body>\n'
-        f'<h1>{safe_title}</h1>\n'
-        '<div id="js_content">\n' + raw_localized + '\n</div>\n'
-        '</body>\n</html>'
-    )
-    (art_dir / f"{safe_title}_raw.html").write_text(raw_full_html, encoding="utf-8")
+    raw_localized = activate_lazy_images(content_html)
+    if settings.get("save_raw_html", False):
+        raw_full_html = full_html.replace(localized, raw_localized, 1)
+        (art_dir / f"{basename}_raw.html").write_text(raw_full_html, encoding="utf-8")
 
     # 提取公众号 source 名字
     source = ""
@@ -1406,8 +1409,11 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     (art_dir / "data.json").write_text(json.dumps(new_json_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 保存纯文本内容（用于 AI 一键转写）
-    clean_text = clean_html_to_text(filtered_html)
-    (art_dir / "content.txt").write_text(clean_text, encoding="utf-8")
+    text_path = art_dir / f"{basename}.txt"
+    if settings.get("save_text", False):
+        text_path.write_text(clean_html_to_text(filtered_html), encoding="utf-8")
+
+    export_errors = []
 
     # 1. 保存 Markdown (.md) 文件
     save_markdown = settings.get("save_markdown", True)
@@ -1421,22 +1427,35 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
                 "cover_url": cover_url,
                 "publish_time": publish_time,
             }
-            md_text = html_to_markdown(filtered_html, meta=md_meta, media_map=url_map)
-            md_file_path = art_dir / f"{safe_title}.md"
+            md_text = html_to_markdown(localized, meta=md_meta, media_map=url_map)
+            md_file_path = art_dir / f"{basename}.md"
             md_file_path.write_text(md_text, encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as exc:
+            export_errors.append(f"Markdown 导出失败: {exc}")
 
     # 2. 导出 PDF (.pdf) 文件
-    save_pdf = settings.get("save_pdf", True)
+    save_pdf = settings.get("save_pdf", False)
     pdf_file_path = None
     if save_pdf:
         try:
-            target_pdf = art_dir / f"{safe_title}.pdf"
-            if export_html_to_pdf(html_path, target_pdf, title=safe_title):
+            target_pdf = art_dir / f"{basename}.pdf"
+            # PDF-only exports use a temporary HTML input, never a second export.
+            if html_path.exists():
+                exported = export_html_to_pdf(html_path, target_pdf, title=safe_title)
+            else:
+                with tempfile.TemporaryDirectory(prefix=".pdf-", dir=art_dir) as temp_dir:
+                    temp_html = Path(temp_dir) / "article.html"
+                    # Resolve resources against the article directory without
+                    # changing article text or remote URLs.
+                    base = f'<base href="{art_dir.resolve().as_uri()}/">'
+                    temp_html.write_text(full_html.replace('<head>', '<head>' + base, 1), encoding="utf-8")
+                    exported = export_html_to_pdf(temp_html, target_pdf, title=safe_title)
+            if exported and target_pdf.is_file():
                 pdf_file_path = target_pdf
-        except Exception:
-            pass
+            else:
+                export_errors.append("PDF 导出失败，请检查 Chromium 是否可用")
+        except Exception as exc:
+            export_errors.append(f"PDF 导出失败: {exc}")
 
     # 保存元数据
     meta = {
@@ -1453,20 +1472,28 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         "resources_count": len(url_map),
         "videos_count": len(video_iframes),
         "leftover_urls": len(find_mmbiz_urls(localized)),
-        "has_clean_text": True,
-        "clean_text_file": "content.txt",
+        "has_html": html_path.exists(),
+        "html_file": html_path.name if html_path.exists() else "",
+        "image_mode": image_mode,
+        "export_errors": export_errors,
+        "has_clean_text": text_path.exists(),
+        "clean_text_file": text_path.name if text_path.exists() else "",
         "has_markdown": md_file_path is not None and md_file_path.exists(),
-        "markdown_file": f"{safe_title}.md" if (md_file_path and md_file_path.exists()) else "",
+        "markdown_file": f"{basename}.md" if (md_file_path and md_file_path.exists()) else "",
         "has_pdf": pdf_file_path is not None and pdf_file_path.exists(),
-        "pdf_file": f"{safe_title}.pdf" if (pdf_file_path and pdf_file_path.exists()) else "",
+        "pdf_file": f"{basename}.pdf" if (pdf_file_path and pdf_file_path.exists()) else "",
     }
     (art_dir / "metadata.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
 
+    if media_dir.exists() and not any(media_dir.iterdir()):
+        media_dir.rmdir()
+
     return {
-        "success": True,
+        "success": not export_errors,
+        "error": "; ".join(export_errors),
         "title": safe_title,
         "source": source,
         "author": author or source,

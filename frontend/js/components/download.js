@@ -10,6 +10,7 @@ const DownloadPage = {
             <div class="page-header">
                 <h2 class="page-title">网址下载</h2>
                 <p class="page-description">输入微信公众号文章 URL，直接下载文章内容（含图片和视频）</p>
+                <button class="btn btn-secondary btn-sm" onclick="Router.navigate('settings')">设置导出格式、图片和日期命名</button>
             </div>
 
             <div class="card" style="margin-bottom: var(--spacing-lg);">

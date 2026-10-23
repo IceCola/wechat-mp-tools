@@ -54,14 +54,35 @@ const SettingsPage = {
                                 <input type="checkbox" id="setting-save-videos" style="width: 18px; height: 18px; accent-color: var(--primary);" />
                                 <span>自动下载文章视频</span>
                             </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="setting-image-mode">图片保存方式</label>
+                            <select class="form-input" id="setting-image-mode">
+                                <option value="local">下载到本地 media 文件夹</option>
+                                <option value="embedded">内嵌到 HTML / Markdown（Base64）</option>
+                            </select>
+                            <div class="form-hint">需勾选“自动下载文章图片”。内嵌模式不保留独立图片文件；PDF 本身包含图片。部分 Markdown 阅读器不支持 Base64 图片。</div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">文章导出格式（可多选）</label>
+                            <div style="display: flex; flex-wrap: wrap; gap: 20px;">
+                            <label class="form-checkbox-label"><input type="checkbox" id="setting-save-html" style="width: 18px; height: 18px; accent-color: var(--primary);" /> HTML</label>
+                            <label class="form-checkbox-label"><input type="checkbox" id="setting-save-text" style="width: 18px; height: 18px; accent-color: var(--primary);" /> 纯文本 (.txt)</label>
                             <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
                                 <input type="checkbox" id="setting-save-markdown" style="width: 18px; height: 18px; accent-color: var(--primary);" />
-                                <span>自动导出 Markdown (.md)</span>
+                                <span>Markdown (.md)</span>
                             </label>
                             <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
                                 <input type="checkbox" id="setting-save-pdf" style="width: 18px; height: 18px; accent-color: var(--primary);" />
-                                <span>自动导出 PDF (.pdf)</span>
+                                <span>PDF (.pdf)</span>
                             </label>
+                            <label class="form-checkbox-label"><input type="checkbox" id="setting-save-raw-html" style="width: 18px; height: 18px; accent-color: var(--primary);" /> 原始 HTML（保留在线图片链接）</label>
+                            </div>
+                            <div class="form-hint">至少选择一种格式。仅生成勾选的导出文件；data.json 和 metadata.json 用于下载记录及 RSS，始终保留。</div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-checkbox-label"><input type="checkbox" id="setting-filename-date" style="width: 18px; height: 18px; accent-color: var(--primary);" /> 文件名和文章文件夹加上发布日期</label>
+                            <div class="form-hint">例如：2026-10-23_文章标题.md。日期按北京时间计算；无法获取发布日期时仅使用标题。以上设置适用于之后的单篇、批量及 RSS 下载。</div>
                         </div>
                     </div>
                 </div>
@@ -291,7 +312,17 @@ const SettingsPage = {
         if (saveImagesCheck) saveImagesCheck.checked = data.auto_save_images !== undefined ? !!data.auto_save_images : true;
         if (saveVideosCheck) saveVideosCheck.checked = data.auto_save_videos !== undefined ? !!data.auto_save_videos : true;
         if (saveMarkdownCheck) saveMarkdownCheck.checked = data.save_markdown !== undefined ? !!data.save_markdown : true;
-        if (savePdfCheck) savePdfCheck.checked = data.save_pdf !== undefined ? !!data.save_pdf : true;
+        if (savePdfCheck) savePdfCheck.checked = data.save_pdf !== undefined ? !!data.save_pdf : false;
+        for (const [id, key, fallback] of [
+            ['setting-save-html', 'save_html', true],
+            ['setting-save-text', 'save_text', false],
+            ['setting-save-raw-html', 'save_raw_html', false],
+            ['setting-filename-date', 'filename_date', false],
+        ]) {
+            const input = document.getElementById(id);
+            if (input) input.checked = data[key] !== undefined ? !!data[key] : fallback;
+        }
+        document.getElementById('setting-image-mode').value = data.image_mode || 'local';
         if (delayInput) delayInput.value = data.request_delay || 0.8;
         if (delayRange) delayRange.value = data.request_delay || 0.8;
         if (pageSizeInput) pageSizeInput.value = data.page_size || 10;
@@ -376,7 +407,12 @@ const SettingsPage = {
             auto_save_images: saveImagesCheck.checked,
             auto_save_videos: saveVideosCheck.checked,
             save_markdown: saveMarkdownCheck ? saveMarkdownCheck.checked : true,
-            save_pdf: savePdfCheck ? savePdfCheck.checked : true,
+            save_pdf: savePdfCheck ? savePdfCheck.checked : false,
+            save_html: document.getElementById('setting-save-html').checked,
+            save_text: document.getElementById('setting-save-text').checked,
+            save_raw_html: document.getElementById('setting-save-raw-html').checked,
+            image_mode: document.getElementById('setting-image-mode').value,
+            filename_date: document.getElementById('setting-filename-date').checked,
             request_delay: request_delay,
             page_size: parseInt(pageSizeInput.value) || 10,
             max_articles: parseInt(maxArticlesInput.value) || 50,
@@ -395,6 +431,10 @@ const SettingsPage = {
             bili_download_subtitle: biliSubtitle ? biliSubtitle.checked : true,
         };
 
+        if (!['save_html', 'save_markdown', 'save_pdf', 'save_text', 'save_raw_html'].some(key => settings[key])) {
+            Toast.warning('请至少选择一种文章导出格式');
+            return;
+        }
         try {
             await API.settings.save(settings);
             Toast.success('设置已保存');
@@ -417,6 +457,13 @@ const SettingsPage = {
                 concurrent_downloads: 1,
                 auto_save_images: true,
                 auto_save_videos: true,
+                save_html: true,
+                save_markdown: true,
+                save_pdf: false,
+                save_text: false,
+                save_raw_html: false,
+                image_mode: 'local',
+                filename_date: false,
                 device_id: '公众号_caiji100',
                 rss_start_hour: 0,
                 rss_start_minute: 0,

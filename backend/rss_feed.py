@@ -330,6 +330,8 @@ def _read_content(item: dict, base_url: str) -> str:
 
         # 回落方案：读取 content.txt 并用段落包裹
         txt = p / "content.txt"
+        if not txt.is_file():
+            txt = next(iter(sorted(p.glob("*.txt"))), txt)
         if txt.is_file():
             text = txt.read_text(encoding="utf-8", errors="replace")
             lines = [f"<p>{html.escape(ln)}</p>" for ln in text.splitlines() if ln.strip()]
@@ -337,6 +339,14 @@ def _read_content(item: dict, base_url: str) -> str:
             if len(body) > MAX_CONTENT_CHARS:
                 body = body[:MAX_CONTENT_CHARS]
             return body
+
+        # Export selection may omit both HTML and text. Reuse existing source
+        # data for RSS rather than creating an unrequested export on disk.
+        data = load_json(p / "data.json", {})
+        if isinstance(data, dict) and data.get("content"):
+            from backend.content_filter import filter_article_html
+            body = _rss_article_body(filter_article_html(data["content"]), base_url)
+            return body[:MAX_CONTENT_CHARS]
     except OSError:
         return ""
     return ""

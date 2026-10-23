@@ -21,6 +21,7 @@ const ArticlesPage = {
             <div class="page-header">
                 <h2 class="page-title">文章下载</h2>
                 <p class="page-description">选择公众号，浏览并下载文章</p>
+                <button class="btn btn-secondary btn-sm" onclick="Router.navigate('settings')">设置导出格式、图片和日期命名</button>
             </div>
 
             <!-- 公众号选择器 -->
