@@ -286,7 +286,7 @@ def refilter_existing(download_dir, dry_run: bool = True, force: bool = False) -
     """对已下载的文章重新跑一遍过滤。
 
     只处理「清洗后」的 ``<标题>.html``，改写前留一份 ``.html.bak``；
-    ``content.txt`` 同步重算（RSS 读的就是它）。``_raw.html`` 不动。
+    已选择导出的文本同步重算；旧目录兼容 content.txt。``_raw.html`` 不动。
     """
     from backend.downloader import clean_html_to_text
 
@@ -346,10 +346,13 @@ def refilter_existing(download_dir, dry_run: bool = True, force: bool = False) -
                         body_html = str(node)
                 except Exception:  # noqa: BLE001
                     pass
-                (art_dir / "content.txt").write_text(
-                    clean_html_to_text(body_html), encoding="utf-8"
-                )
-                result["content_updated"] += 1
+                meta_path = art_dir / "metadata.json"
+                meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+                if meta.get("has_clean_text", True):
+                    text_name = meta.get("clean_text_file") or "content.txt"
+                    text_path = art_dir / Path(text_name).name
+                    text_path.write_text(clean_html_to_text(body_html), encoding="utf-8")
+                    result["content_updated"] += 1
             except Exception as exc:  # noqa: BLE001
                 result["errors"].append(f"{art_dir.name}: {exc}")
 

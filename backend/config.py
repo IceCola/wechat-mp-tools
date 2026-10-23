@@ -55,7 +55,12 @@ DEFAULT_SETTINGS = {
     "auto_save_images": True,
     "auto_save_videos": True,
     "save_markdown": True,
-    "save_pdf": True,
+    "save_pdf": False,
+    "save_html": True,
+    "save_text": False,
+    "save_raw_html": False,
+    "image_mode": "local",
+    "filename_date": False,
     "device_id": "公众号_caiji100",
     "rss_start_hour": 0,
     "rss_start_minute": 0,
@@ -127,8 +132,23 @@ def get_settings() -> dict:
     return settings
 
 
+def validate_download_settings(settings: dict):
+    """Reject invalid export options before saving or starting a download."""
+    keys = ("save_html", "save_markdown", "save_pdf", "save_text", "save_raw_html",
+            "auto_save_images", "filename_date")
+    for key in keys:
+        value = settings.get(key, DEFAULT_SETTINGS[key])
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} 必须是布尔值")
+    if not any(settings.get(k, DEFAULT_SETTINGS[k]) for k in keys[:5]):
+        raise ValueError("请至少选择一种文章导出格式")
+    if settings.get("image_mode", "local") not in ("local", "embedded"):
+        raise ValueError("图片保存方式必须是 local 或 embedded")
+
+
 def save_settings(settings: dict):
     """保存应用设置"""
+    validate_download_settings(settings)
     save_json(APP_SETTINGS_FILE, settings)
 
 

@@ -144,7 +144,10 @@ def save_settings():
     data = request.get_json() or {}
     settings = _get()
     settings.update(data)
-    _save(settings)
+    try:
+        _save(settings)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     return jsonify({"message": "设置已保存"})
 
 
