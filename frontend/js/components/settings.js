@@ -70,14 +70,16 @@ const SettingsPage = {
                             <label class="form-checkbox-label"><input type="checkbox" id="setting-save-text" style="width: 18px; height: 18px; accent-color: var(--primary);" /> 纯文本 (.txt)</label>
                             <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
                                 <input type="checkbox" id="setting-save-markdown" style="width: 18px; height: 18px; accent-color: var(--primary);" />
-                                <span>Markdown (.md)</span>
+                                <span>阅读版 Markdown（按图片保存方式处理）</span>
                             </label>
                             <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
                                 <input type="checkbox" id="setting-save-pdf" style="width: 18px; height: 18px; accent-color: var(--primary);" />
                                 <span>PDF (.pdf)</span>
                             </label>
                             <label class="form-checkbox-label"><input type="checkbox" id="setting-save-raw-html" style="width: 18px; height: 18px; accent-color: var(--primary);" /> 原始 HTML（保留在线图片链接）</label>
+                            <label class="form-checkbox-label"><input type="checkbox" id="setting-save-raw-markdown" style="width: 18px; height: 18px; accent-color: var(--primary);" /> 原始 Markdown（远程图片 URL，不过滤正文）</label>
                             </div>
+                            <label class="form-checkbox-label"><input type="checkbox" id="setting-fetch-comments" /> 尝试加载精选留言（原始格式启用，需要 Chromium；未获取到时记录状态）</label>
                             <div class="form-hint">至少选择一种格式。仅生成勾选的导出文件；data.json 和 metadata.json 用于下载记录及 RSS，始终保留。</div>
                         </div>
                         <div class="form-group">
@@ -316,7 +318,9 @@ const SettingsPage = {
         for (const [id, key, fallback] of [
             ['setting-save-html', 'save_html', true],
             ['setting-save-text', 'save_text', false],
-            ['setting-save-raw-html', 'save_raw_html', false],
+            ['setting-save-raw-html', 'save_raw_html', true],
+            ['setting-save-raw-markdown', 'save_raw_markdown', true],
+            ['setting-fetch-comments', 'fetch_comments', true],
             ['setting-filename-date', 'filename_date', false],
         ]) {
             const input = document.getElementById(id);
@@ -411,6 +415,8 @@ const SettingsPage = {
             save_html: document.getElementById('setting-save-html').checked,
             save_text: document.getElementById('setting-save-text').checked,
             save_raw_html: document.getElementById('setting-save-raw-html').checked,
+            save_raw_markdown: document.getElementById('setting-save-raw-markdown').checked,
+            fetch_comments: document.getElementById('setting-fetch-comments').checked,
             image_mode: document.getElementById('setting-image-mode').value,
             filename_date: document.getElementById('setting-filename-date').checked,
             request_delay: request_delay,
@@ -431,7 +437,7 @@ const SettingsPage = {
             bili_download_subtitle: biliSubtitle ? biliSubtitle.checked : true,
         };
 
-        if (!['save_html', 'save_markdown', 'save_pdf', 'save_text', 'save_raw_html'].some(key => settings[key])) {
+        if (!['save_html', 'save_markdown', 'save_pdf', 'save_text', 'save_raw_html', 'save_raw_markdown'].some(key => settings[key])) {
             Toast.warning('请至少选择一种文章导出格式');
             return;
         }
@@ -461,7 +467,9 @@ const SettingsPage = {
                 save_markdown: true,
                 save_pdf: false,
                 save_text: false,
-                save_raw_html: false,
+                save_raw_html: true,
+                save_raw_markdown: true,
+                fetch_comments: true,
                 image_mode: 'local',
                 filename_date: false,
                 device_id: '公众号_caiji100',

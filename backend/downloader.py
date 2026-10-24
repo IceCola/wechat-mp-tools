@@ -26,6 +26,9 @@ from backend.config import (
 )
 from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
 from backend.avatar_cache import extract_account_avatar, extract_avatar_account_id
+from backend.original_article import (
+    complete_raw_html, extract_rendered_comments, metadata_header, original_metadata,
+)
 from backend.request_profile import (
     SIGNATURE_WINDOW,
     get_cdn_client,
@@ -74,7 +77,7 @@ class HTMLToMarkdownParser(HTMLParser):
         if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             self.heading_level = int(tag[1])
             self.heading_text = []
-        elif tag == 'p':
+        elif tag in ('p', 'section', 'div', 'article', 'header'):
             self._ensure_newline(2)
         elif tag == 'br':
             self.pieces.append('\n')
@@ -135,7 +138,7 @@ class HTMLToMarkdownParser(HTMLParser):
             else:
                 self.link_stack.append(None)
         elif tag == 'img':
-            src = attr_dict.get('src') or attr_dict.get('data-src') or ''
+            src = attr_dict.get('data-src') or attr_dict.get('src') or ''
             if src:
                 src = src.strip()
                 local_src = self.media_map.get(src, src)
@@ -165,7 +168,7 @@ class HTMLToMarkdownParser(HTMLParser):
                 self.pieces.append(f"{'#' * level} {text}\n\n")
             self.heading_level = 0
             self.heading_text = []
-        elif tag == 'p':
+        elif tag in ('p', 'section', 'div', 'article', 'header'):
             self._ensure_newline(2)
         elif tag in ('strong', 'b'):
             self.bold_depth = max(0, self.bold_depth - 1)
@@ -329,6 +332,8 @@ def html_to_markdown(html_content: str, meta: dict = None, media_map: dict = Non
             header_parts.append(f'# {title}\n\n')
 
         author_info = []
+        if meta.get('is_original'):
+            author_info.append('原创')
         author = meta.get('author')
         account = meta.get('source') or meta.get('account')
         if author:
@@ -343,7 +348,7 @@ def html_to_markdown(html_content: str, meta: dict = None, media_map: dict = Non
         if publish_time:
             try:
                 if isinstance(publish_time, (int, float)):
-                    dt = datetime.fromtimestamp(publish_time)
+                    dt = datetime.fromtimestamp(publish_time, timezone(timedelta(hours=8)))
                     date_info.append(f"_{dt.strftime('%Y年%m月%d日 %H:%M')}_")
                 elif isinstance(publish_time, str):
                     date_info.append(f"_{publish_time}_")
@@ -724,6 +729,11 @@ def _choose_video_url(candidates: list) -> str:
 
 
 def extract_article_content(raw_html: str) -> str:
+    # DOM boundaries prevent truncating a nested body or swallowing page chrome.
+    soup = BeautifulSoup(raw_html, "html.parser")
+    body = soup.select_one("#js_content, .rich_media_content")
+    if body is not None and (body.get_text(strip=True) or body.find(["img", "video", "iframe"])):
+        return body.decode_contents()
     marker = 'id="js_content"'
     marker_pos = raw_html.find(marker)
     if marker_pos < 0:
@@ -960,8 +970,13 @@ def fetch_via_headless_browser(url: str, proxy_url: str = None) -> tuple[str, st
 
                 # 模拟轻度滚动以触发图片懒加载
                 try:
-                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight / 3)")
-                    page.wait_for_timeout(600)
+                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(1500)
+                    try:
+                        page.wait_for_selector("#js_cmt_list .comment_item, #js_cmt_area .js_comment_item, .comment-item",
+                                               timeout=3000)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -1361,14 +1376,8 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     )
 
     html_path = art_dir / f"{basename}.html"
-    if settings.get("save_html", True):
-        html_path.write_text(full_html, encoding="utf-8")
-
-    # 生成并保存原始 HTML (保持外部资源链接不变)
+    # Original exports are independent of filtered/localized reading exports.
     raw_localized = activate_lazy_images(content_html)
-    if settings.get("save_raw_html", False):
-        raw_full_html = full_html.replace(localized, raw_localized, 1)
-        (art_dir / f"{basename}_raw.html").write_text(raw_full_html, encoding="utf-8")
 
     # 提取公众号 source 名字
     source = ""
@@ -1397,6 +1406,39 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         if author_match:
             author = unescape(author_match.group(1)).strip()
 
+    page_info = original_metadata(raw_html)
+    author = author or page_info['author']
+    source = source or page_info['source']
+    md_meta = {"title": page_title or safe_title, "author": author, "source": source,
+               "cover_url": cover_url, "publish_time": publish_time,
+               "is_original": page_info['is_original']}
+    comments_html = extract_rendered_comments(raw_html)
+    comments_status = "captured" if comments_html else "unavailable"
+    comment_warning = ""
+    original_selected = settings.get("save_raw_html", True) or settings.get("save_raw_markdown", True)
+    if original_selected and settings.get("fetch_comments", True) and not comments_html:
+        rendered, comment_error = fetch_via_headless_browser(final_url or clean_url, proxy_url=proxy_url)
+        if rendered:
+            rendered_info = original_metadata(rendered)
+            author = author or rendered_info['author']
+            source = source or rendered_info['source']
+            page_info['is_original'] = page_info['is_original'] or rendered_info['is_original']
+            md_meta.update(author=author, source=source, is_original=page_info['is_original'])
+        comments_html = extract_rendered_comments(rendered) if rendered else ""
+        comments_status = "captured" if comments_html else "unavailable"
+        if not comments_html:
+            comment_warning = comment_error or "页面未返回可归档的留言；可能需要微信登录态，不能据此认定没有留言"
+            logger.warning("留言未获取：%s", comment_warning)
+    elif not comments_html:
+        comment_warning = "抓取页面中没有已加载的留言" if original_selected else "未请求原始格式的留言加载"
+    full_html = full_html.replace(f'<h1>{safe_title}</h1>', metadata_header(md_meta), 1)
+    if settings.get("save_html", True):
+        html_path.write_text(full_html, encoding="utf-8")
+    if settings.get("save_raw_html", True):
+        # Preserve the complete response rather than a body-only reconstruction.
+        original_page = complete_raw_html(raw_html, md_meta, comments_html)
+        (art_dir / f"{basename}_raw.html").write_text(activate_lazy_images(original_page), encoding="utf-8")
+
     new_json_data = {
         "source": source,
         "author": author,
@@ -1404,7 +1446,10 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         "url": url,
         "cover_url": cover_url,
         "publish_time": publish_time,
-        "content": raw_localized
+        "content": raw_localized,
+        "comments_html": comments_html,
+        "comments_status": comments_status,
+        "is_original": page_info['is_original'],
     }
     (art_dir / "data.json").write_text(json.dumps(new_json_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1414,19 +1459,19 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         text_path.write_text(clean_html_to_text(filtered_html), encoding="utf-8")
 
     export_errors = []
+    raw_md_path = None
+    if settings.get("save_raw_markdown", True):
+        try:
+            raw_md_path = art_dir / f"{basename}_raw.md"
+            raw_md_path.write_text(html_to_markdown(raw_localized + comments_html, meta=md_meta) + "\n", encoding="utf-8")
+        except Exception as exc:
+            export_errors.append(f"原始 Markdown 导出失败: {exc}")
 
     # 1. 保存 Markdown (.md) 文件
     save_markdown = settings.get("save_markdown", True)
     md_file_path = None
     if save_markdown:
         try:
-            md_meta = {
-                "title": page_title or safe_title,
-                "author": author,
-                "source": source,
-                "cover_url": cover_url,
-                "publish_time": publish_time,
-            }
             md_text = html_to_markdown(localized, meta=md_meta, media_map=url_map)
             md_file_path = art_dir / f"{basename}.md"
             md_file_path.write_text(md_text, encoding="utf-8")
@@ -1459,7 +1504,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
 
     # 保存元数据
     meta = {
-        "title": safe_title,
+        "title": page_title or safe_title,
         "url": url,
         "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "publish_time": publish_time,
@@ -1469,6 +1514,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         "digest": digest,
         "source": source,
         "author": author,
+        "is_original": page_info['is_original'],
+        "comments_status": comments_status,
+        "comments_warning": comment_warning,
         "resources_count": len(url_map),
         "videos_count": len(video_iframes),
         "leftover_urls": len(find_mmbiz_urls(localized)),
@@ -1480,6 +1528,10 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         "clean_text_file": text_path.name if text_path.exists() else "",
         "has_markdown": md_file_path is not None and md_file_path.exists(),
         "markdown_file": f"{basename}.md" if (md_file_path and md_file_path.exists()) else "",
+        "has_raw_markdown": raw_md_path is not None and raw_md_path.exists(),
+        "raw_markdown_file": raw_md_path.name if raw_md_path and raw_md_path.exists() else "",
+        "has_raw_html": (art_dir / f"{basename}_raw.html").is_file(),
+        "raw_html_file": f"{basename}_raw.html" if (art_dir / f"{basename}_raw.html").is_file() else "",
         "has_pdf": pdf_file_path is not None and pdf_file_path.exists(),
         "pdf_file": f"{basename}.pdf" if (pdf_file_path and pdf_file_path.exists()) else "",
     }
@@ -1503,6 +1555,10 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         "digest": digest,
         "publish_time": publish_time,
         "has_markdown": meta["has_markdown"],
+        "has_raw_markdown": meta["has_raw_markdown"],
+        "raw_markdown_path": str(raw_md_path) if raw_md_path and raw_md_path.exists() else "",
+        "comments_status": comments_status,
+        "comments_warning": comment_warning,
         "markdown_path": str(md_file_path) if md_file_path and md_file_path.exists() else "",
         "has_pdf": meta["has_pdf"],
         "pdf_path": str(pdf_file_path) if pdf_file_path and pdf_file_path.exists() else "",
