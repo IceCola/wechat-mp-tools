@@ -940,7 +940,7 @@ def _sync_history_from_disk(history: list) -> bool:
                             except Exception:
                                 pass
 
-                        has_md = meta.get("has_markdown") if "has_markdown" in meta else (any(art_dir.glob("*.md")))
+                        has_md = bool(meta.get("has_markdown") or meta.get("has_raw_markdown")) if "has_markdown" in meta else (any(art_dir.glob("*.md")))
                         has_pdf = meta.get("has_pdf") if "has_pdf" in meta else (any(art_dir.glob("*.pdf")))
                         new_item = {
                             "title": meta.get("title") or art_dir.name,
@@ -1205,7 +1205,7 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                 "cover_url": result.get("cover_url", ""),
                 "digest": result.get("digest", ""),
                 "publish_time": result.get("publish_time", int(time.time())),
-                "has_markdown": result.get("has_markdown", False),
+                "has_markdown": bool(result.get("has_markdown") or result.get("has_raw_markdown")),
                 "has_pdf": result.get("has_pdf", False),
             }
             history.append(hist_entry)
@@ -1312,7 +1312,7 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
         "cover_url": result.get("cover_url", ""),
         "digest": result.get("digest", ""),
         "publish_time": result.get("publish_time", int(time.time())),
-        "has_markdown": result.get("has_markdown", False),
+        "has_markdown": bool(result.get("has_markdown") or result.get("has_raw_markdown")),
         "has_pdf": result.get("has_pdf", False),
         "review_id": review_id,
     }
@@ -1694,7 +1694,8 @@ def open_file():
                 else:
                     return jsonify({"error": "未找到 PDF 文件"}), 404
             elif target_type in ("md", "markdown"):
-                mds = list(path.glob("*.md"))
+                # 两种 Markdown 共存时，原有打开按钮仍优先阅读版；只导出原始版也可打开。
+                mds = sorted(path.glob("*.md"), key=lambda p: (p.name.endswith("_raw.md"), p.name))
                 if mds:
                     resolved_target = mds[0]
                 else:

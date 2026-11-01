@@ -162,7 +162,7 @@ class TestMarkdownAndPDF(unittest.TestCase):
         mock_cdn_client.return_value.get.return_value = mock_response
 
         out_dir = self.test_dir / "download_out"
-        with patch("backend.downloader.get_settings", return_value={**DEFAULT_SETTINGS, "save_pdf": True}):
+        with patch("backend.downloader.get_settings", return_value={**DEFAULT_SETTINGS, "save_pdf": True, "fetch_comments": False}):
             result = download_single_article("https://mp.weixin.qq.com/s/mock_article", out_dir, "端到端下载导出测试")
 
         self.assertTrue(mock_data_client.return_value.get.called, "文章抓取必须走 data client")

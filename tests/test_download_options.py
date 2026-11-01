@@ -18,7 +18,7 @@ IMAGE = 'https://mmbiz.qpic.cn/image.png'
 PAGE = ('<html><head><meta property="og:title" content="测试标题"></head><body>'
         '<script>var ct = "1792686600";</script>'  # 2026-10-22 16:30 UTC -> Oct 23 Beijing
         '<div id="js_content"><p>测试正文</p><img src="data:image/gif;base64,placeholder" srcset="https://mmbiz.qpic.cn/srcset.png 2x" data-src="' + IMAGE + '"></div></body></html>')
-FORMAT_KEYS = ('save_html', 'save_markdown', 'save_pdf', 'save_text', 'save_raw_html')
+FORMAT_KEYS = ('save_html', 'save_markdown', 'save_pdf', 'save_text', 'save_raw_html', 'save_raw_markdown')
 
 
 class DownloadOptionsTests(unittest.TestCase):
@@ -28,6 +28,7 @@ class DownloadOptionsTests(unittest.TestCase):
         self.root = Path(directory.name)
         self.settings = {**config.DEFAULT_SETTINGS, **{key: False for key in FORMAT_KEYS},
                          'save_markdown': True, 'auto_save_videos': False,
+                         'fetch_comments': False,
                          'download_dir': str(self.root)}
         for target, kwargs in [
             ('backend.downloader.get_settings', {'side_effect': lambda: self.settings.copy()}),
@@ -60,7 +61,7 @@ class DownloadOptionsTests(unittest.TestCase):
         return Path(result['path'])
 
     def test_each_selected_format_is_the_only_export(self):
-        for key, suffix in zip(FORMAT_KEYS, ('.html', '.md', '.pdf', '.txt', '_raw.html')):
+        for key, suffix in zip(FORMAT_KEYS, ('.html', '.md', '.pdf', '.txt', '_raw.html', '_raw.md')):
             with self.subTest(key=key):
                 self.settings.update({k: k == key for k in FORMAT_KEYS})
                 def pdf(source, target, title=''):
@@ -75,7 +76,7 @@ class DownloadOptionsTests(unittest.TestCase):
                 self.assertEqual([p.name for p in exports], ['测试标题' + suffix])
                 self.assertEqual(export.call_count, int(key == 'save_pdf'))
                 self.assertFalse(any(p.name.startswith('.pdf-') for p in path.iterdir()))
-                if key in ('save_text', 'save_raw_html'):
+                if key in ('save_text', 'save_raw_html', 'save_raw_markdown'):
                     self.assertFalse((path / 'media').exists())
 
     def test_embedded_images_have_real_mime_and_no_image_files(self):
@@ -141,7 +142,7 @@ class DownloadOptionsTests(unittest.TestCase):
                 self.settings.update(bad)
                 with self.assertRaises(ValueError):
                     downloader.download_single_article(URL, self.root)
-                self.settings = {**config.DEFAULT_SETTINGS, 'save_pdf': False}
+                self.settings = {**config.DEFAULT_SETTINGS, 'save_pdf': False, 'fetch_comments': False}
         self.fetch_mock.assert_not_called()
         with patch.object(config, 'APP_SETTINGS_FILE', self.root / 'settings.json'):
             config.save_settings(self.settings)
