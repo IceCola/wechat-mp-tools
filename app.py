@@ -45,7 +45,7 @@ from backend.runtime import configure_runtime, resource_dir
 
 configure_runtime()
 
-from backend.config import ensure_dirs
+from backend.config import ensure_dirs, init_admin_auth
 from backend.auth import auth_bp
 from backend.accounts import accounts_bp
 from backend.articles import articles_bp
@@ -74,6 +74,7 @@ app = Flask(
     static_url_path="",
 )
 CORS(app)
+init_admin_auth(app)
 
 # 注册蓝图
 app.register_blueprint(auth_bp)
@@ -95,6 +96,9 @@ app.register_blueprint(bilibili_login_bp)
 app.register_blueprint(updater_bp)
 app.register_blueprint(waterwall_bp)
 
+
+# 确保必要目录与数据库结构就绪
+ensure_dirs()
 
 # 账号池旧数据迁移
 from backend.account_pool import migrate_legacy_config

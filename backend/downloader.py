@@ -8,6 +8,8 @@ import sys
 import os
 import re
 import json
+import time
+import signal
 import shutil
 import subprocess
 import logging
@@ -391,8 +393,45 @@ def find_chromium_executable() -> str | None:
     return None
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """确保进程及其所属进程组的所有后代进程全部被强制清理"""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if sys.platform != "win32" and hasattr(os, "killpg"):
+        try:
+            # 当启用 start_new_session=True 时，PGID 即为 proc.pid
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _reap_zombies() -> None:
+    """非阻塞回收已退出的子进程/孤儿后代，防止僵尸进程 (<defunct>) 在容器内持续积累"""
+    if sys.platform != "win32" and hasattr(os, "waitpid") and hasattr(os, "WNOHANG"):
+        # 仅当 Python 自身作为容器内 PID 1 运行且未配置 init 时，孤儿进程才会重定向到自身，此时需主动回收；
+        # 若已有 init (如 docker-compose 的 init: true 或 tini)，则由 init 自动收割，避免影响其它并发线程的子进程
+        if hasattr(os, "getpid") and os.getpid() == 1:
+            try:
+                while True:
+                    wpid, _ = os.waitpid(-1, os.WNOHANG)
+                    if wpid <= 0:
+                        break
+            except (ChildProcessError, OSError):
+                pass
+
+
 def export_html_to_pdf(html_path: Path, pdf_path: Path, title: str = "") -> bool:
-    """使用 Headless Chrome 将 HTML 文件转换为 PDF"""
+    """使用 Headless Chrome 将 HTML 文件转换为 PDF，并确保完整回收进程树与孤儿后代"""
     chrome_exe = find_chromium_executable()
     if not chrome_exe:
         return False
@@ -407,6 +446,14 @@ def export_html_to_pdf(html_path: Path, pdf_path: Path, title: str = "") -> bool
         "--disable-gpu",
         "--no-pdf-header-footer",
         "--run-all-compositor-stages-before-draw",
+        # 彻底关闭崩溃报告与后台服务，防止派生脱离父进程的 Crashpad / 守护进程
+        "--disable-crash-reporter",
+        "--disable-breakpad",
+        "--disable-dev-shm-usage",
+        "--no-zygote",
+        "--no-first-run",
+        "--disable-background-networking",
+        "--mute-audio",
         f"--print-to-pdf={str(pdf_path)}",
         str(html_path)
     ]
@@ -415,11 +462,30 @@ def export_html_to_pdf(html_path: Path, pdf_path: Path, title: str = "") -> bool
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         cmd.insert(1, "--no-sandbox")
 
+    proc = None
     try:
-        res = subprocess.run(cmd, capture_output=True, timeout=60)
+        # 使用独立的进程组 (start_new_session=True)，防止子进程脱离后遗留为无法回收的孤儿
+        is_posix = sys.platform != "win32"
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=is_posix
+        )
+        proc.communicate(timeout=60)
         return pdf_path.exists() and pdf_path.stat().st_size > 0
-    except Exception:
+    except subprocess.TimeoutExpired:
+        if proc:
+            _kill_process_group(proc)
         return False
+    except Exception:
+        if proc:
+            _kill_process_group(proc)
+        return False
+    finally:
+        if proc:
+            _kill_process_group(proc)
+        _reap_zombies()
 
 
 def clean_html_to_text(html: str) -> str:
@@ -930,6 +996,8 @@ def fetch_via_headless_browser(url: str, proxy_url: str = None) -> tuple[str, st
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
         ]
         proxy_config = None
         if proxy_url:

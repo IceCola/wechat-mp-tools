@@ -32,7 +32,7 @@ from backend.account_pool_api import account_pool_bp
 from backend.accounts import accounts_bp
 from backend.articles import articles_bp
 from backend.auth import auth_bp
-from backend.config import APP_VERSION, ensure_dirs, get_settings, save_settings
+from backend.config import APP_VERSION, ensure_dirs, get_settings, save_settings, init_admin_auth
 from backend.proxy import proxy_bp
 
 ENABLED_MODULES = [
@@ -49,6 +49,7 @@ app = Flask(
     static_url_path="",
 )
 CORS(app)
+init_admin_auth(app)
 
 app.register_blueprint(auth_bp)
 app.register_blueprint(accounts_bp)
@@ -56,6 +57,7 @@ app.register_blueprint(articles_bp)
 app.register_blueprint(account_pool_bp)
 app.register_blueprint(proxy_bp)
 
+ensure_dirs()
 migrate_legacy_config()
 
 # RSS 定时抓取（后台线程，失败不影响服务启动）
