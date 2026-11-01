@@ -189,9 +189,9 @@ def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
 def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "", account_name: str = "", from_article_id: str = "") -> tuple:
     """使用微信读书官方推文聚合引擎获取文章列表 (articles, total_count, can_continue)
     1. 统一 401 静默自愈续期通道，遇到凭据过期自动换取最新 token
-    2. 首屏优先获取 mp/cover 置顶最新推文 (100% 成功率，带 doc_url)
-    3. 获取 mp/chapters 分页推文；若受 499 临时限制自动平滑降级，绝不抛出 500
-    4. 备用通道 article/list 兜底，并发解析每篇推文原生微信链接
+    2. 使用 mp/chapters 分页；成功返回空列表时才尝试 article/list、首屏 mp/cover
+    3. 频控、认证及网络错误向调用方报告，停止继续探测备用接口
+    4. 仅解析当前页推文的原生微信链接
     """
     book_id = biz_to_book_id(fakeid)
     if not book_id:
@@ -199,7 +199,7 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
 
     s = get_weread_session()
 
-    def _do_get(url: str):
+    def _request_page(url: str):
         """内部请求函数：对齐官方 SyncKeyRequestFeature 与 WRRetryHandler 错误码自愈策略"""
         req_url = url
         # 遵循 APK SyncKeyRequestFeature: 同步型接口自动补全 synckey=0 规避 499 拒止
@@ -306,6 +306,20 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                 sleep_backoff(att + 1, base=0.5, cap=4.0)
         return last_resp, last_h, last_acc
 
+    def _do_get(url: str):
+        response, headers, account_id = _request_page(url)
+        from backend.waterwall import is_waterwall_active
+        if is_waterwall_active():
+            raise PermissionError("触发频控或安全验证，请完成验证后重试")
+        if response is None:
+            raise RuntimeError("文章列表请求失败，请稍后重试")
+        if response.status_code != 200:
+            raise RuntimeError(f"文章列表请求失败 (HTTP {response.status_code})，请稍后重试")
+        data = response.json()
+        if data.get("errcode"):
+            raise RuntimeError(f"文章列表请求失败: {data.get('errmsg') or data['errcode']}")
+        return response, headers, account_id
+
     articles = []
     has_more = False
     active_headers = None
@@ -313,64 +327,53 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
 
     # ── 1. 优先尝试从 mp/chapters 获取分页推文列表 (官方标准分页推文接口) ──
     raw_items = []
-    try:
-        url_chap = f"https://i.weread.qq.com/mp/chapters?bookId={book_id}&count={count}&offset={begin}&pf=android"
-        resp_chap, h_chap, acc_chap = _do_get(url_chap)
-        if resp_chap:
-            if resp_chap.status_code == 200:
-                active_headers = h_chap or active_headers
-                active_acc_id = acc_chap or active_acc_id
-                data = resp_chap.json()
-                raw_items = data.get("data") or data.get("chapters") or data.get("list") or []
-                has_more = bool(data.get("hasMore", len(raw_items) >= count))
-            elif resp_chap.status_code in (429, 499):
-                print(f"[_fetch_articles_page] mp/chapters 返回 HTTP {resp_chap.status_code}，启用多级聚合引擎安全平滑降级...", flush=True)
-    except Exception as e:
-        logger.debug("[_fetch_articles_page] mp/chapters 异常: %s", e)
+    url_chap = f"https://i.weread.qq.com/mp/chapters?bookId={book_id}&count={count}&offset={begin}&pf=android"
+    resp_chap, h_chap, acc_chap = _do_get(url_chap)
+    active_headers = h_chap
+    active_acc_id = acc_chap
+    data = resp_chap.json()
+    raw_items = data.get("data") or data.get("chapters") or data.get("list") or []
+    has_more = bool(data.get("hasMore", len(raw_items) >= count))
 
     # ── 2. 备用通道：若推文仍为空，尝试从 article/list 补齐 ──
     from backend.waterwall import WATERWALL
     if len(raw_items) == 0 and not WATERWALL.get("active"):
-        try:
-            u_alist = f"https://i.weread.qq.com/article/list?bookId={book_id}&synckey=0"
-            resp_alist, h_alist, acc_alist = _do_get(u_alist)
-            if resp_alist and resp_alist.status_code == 200:
-                active_headers = h_alist or active_headers
-                active_acc_id = acc_alist or active_acc_id
-                al_data = resp_alist.json()
-                raw_items = al_data.get("reviews") or al_data.get("data") or []
-        except Exception as e:
-            logger.debug("[_fetch_articles_page] article/list 备用拉取异常: %s", e)
+        u_alist = f"https://i.weread.qq.com/article/list?bookId={book_id}&synckey=0"
+        resp_alist, h_alist, acc_alist = _do_get(u_alist)
+        if resp_alist and resp_alist.status_code == 200:
+            active_headers = h_alist or active_headers
+            active_acc_id = acc_alist or active_acc_id
+            al_data = resp_alist.json()
+            fallback_items = al_data.get("reviews") or al_data.get("data") or []
+            raw_items = fallback_items[begin:begin + count]
+            has_more = begin + count < len(fallback_items)
 
     # ── 3. 兜底通道：若推文仍为空且为第一页 (begin == 0)，从 mp/cover 获取置顶/最新封面推文 ──
     if len(raw_items) == 0 and begin == 0 and not WATERWALL.get("active"):
-        try:
-            u_cov = f"https://i.weread.qq.com/mp/cover?bookId={book_id}"
-            resp_cov, h_cov, acc_cov = _do_get(u_cov)
-            if resp_cov and resp_cov.status_code == 200:
-                active_headers = h_cov or active_headers
-                active_acc_id = acc_cov or active_acc_id
-                cdata = resp_cov.json()
-                rid = cdata.get("reviewId", "")
-                if rid:
-                    info = _resolve_review_info(rid, active_headers or {})
-                    t_cov = info.get("title") or cdata.get("title", "")
-                    doc_u = info.get("doc_url") or _resolve_review_doc_url(rid, active_headers or {})
-                    cov_time = info.get("create_time") or cdata.get("createTime") or cdata.get("updateTime") or 0
-                    if not keyword or keyword.lower() in t_cov.lower():
-                        articles.append({
-                            "title": t_cov,
-                            "link": doc_u,
-                            "cover": info.get("cover") or cdata.get("pic", "") or cdata.get("avatar", ""),
-                            "digest": info.get("digest") or "",
-                            "author": info.get("author") or account_name or cdata.get("name", ""),
-                            "update_time": int(cov_time or 0),
-                            "is_original": info.get("is_original", False),
-                            "item_show_type": 0,
-                            "id": rid,
-                        })
-        except Exception as e:
-            logger.debug("[_fetch_articles_page] mp/cover 获取异常: %s", e)
+        u_cov = f"https://i.weread.qq.com/mp/cover?bookId={book_id}"
+        resp_cov, h_cov, acc_cov = _do_get(u_cov)
+        if resp_cov and resp_cov.status_code == 200:
+            active_headers = h_cov or active_headers
+            active_acc_id = acc_cov or active_acc_id
+            cdata = resp_cov.json()
+            rid = cdata.get("reviewId", "")
+            if rid:
+                info = _resolve_review_info(rid, active_headers or {})
+                t_cov = info.get("title") or cdata.get("title", "")
+                doc_u = info.get("doc_url") or _resolve_review_doc_url(rid, active_headers or {})
+                cov_time = info.get("create_time") or cdata.get("createTime") or cdata.get("updateTime") or 0
+                if not keyword or keyword.lower() in t_cov.lower():
+                    articles.append({
+                        "title": t_cov,
+                        "link": doc_u,
+                        "cover": info.get("cover") or cdata.get("pic", "") or cdata.get("avatar", ""),
+                        "digest": info.get("digest") or "",
+                        "author": info.get("author") or account_name or cdata.get("name", ""),
+                        "update_time": int(cov_time or 0),
+                        "is_original": info.get("is_original", False),
+                        "item_show_type": 0,
+                        "id": rid,
+                    })
 
     # ── 4. 并发解析推文原生官方链接 doc_url、真实时间戳及原创标记 ──
     if raw_items:
@@ -505,7 +508,7 @@ def get_articles(fakeid):
         if is_waterwall_active():
             err_res["need_verify"] = True
             err_res["waterwall"] = waterwall_snapshot()
-        return jsonify(err_res), 200
+        return jsonify(err_res), 502
 
 
 @articles_bp.route("/list-via-appmsg/<fakeid>", methods=["GET"])
@@ -1351,7 +1354,7 @@ def _do_range_download(
                     return
                 task["current"] = f"正在获取第 {begin // page_size + 1} 页"
 
-            res = _fetch_articles_page(fakeid, begin, page_size, keyword, account_name=account_name)
+            res = _fetch_articles_page(fakeid, begin, page_size, "", account_name=account_name)
             articles, total_count = res[0], res[1]
             if not articles:
                 stop = True
@@ -1362,17 +1365,20 @@ def _do_range_download(
             with _download_lock:
                 _download_tasks[task_id]["scanned"] += len(articles)
 
-            out_of_range_count = 0
+            reached_start = False
             for article in articles:
                 article_time = article.get("update_time") or 0
                 if article_time > 0:
                     if end_time and article_time > end_time:
                         continue
                     if start_time and article_time < start_time:
-                        out_of_range_count += 1
+                        reached_start = True
                         continue
                 elif start_time or end_time:
                     # 避免在指定具体时间范围时误下载时间未知的旧置顶/封面推文
+                    continue
+
+                if keyword and keyword.lower() not in article.get("title", "").lower():
                     continue
 
                 link = normalize_wechat_short_url(article.get("link", ""))
@@ -1426,19 +1432,21 @@ def _do_range_download(
                 downloaded_index += 1
                 sleep_throttled(max(1.0, delay) + random.uniform(0.3, 0.8), min_delay=1.2)
 
-            # 当前页所有具备有效时间戳的文章都早于 start_time，停止后续扫描
-            valid_time_count = sum(1 for a in articles if (a.get("update_time") or 0) > 0)
-            if start_time > 0 and valid_time_count > 0 and out_of_range_count >= valid_time_count:
+            # 扫完边界页，保留同页内乱序的范围内文章，不再请求更早的页。
+            if reached_start:
                 stop = True
                 with _download_lock:
                     _download_tasks[task_id]["stop_reason"] = "已到达所选时间范围之前的文章"
                 break
 
             begin += page_size
-            if total_count and begin >= total_count:
+            if not res[2] or (total_count and begin >= total_count):
                 with _download_lock:
                     _download_tasks[task_id]["stop_reason"] = "已扫描全部文章"
                 break
+
+            # 即使整页都已下载、超出结束日期或不匹配关键词，也必须限制翻页频率。
+            sleep_throttled(max(1.0, delay) + random.uniform(0.3, 0.8), min_delay=1.2)
 
         save_json(DOWNLOAD_HISTORY_FILE, history)
         with _download_lock:

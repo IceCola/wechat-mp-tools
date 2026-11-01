@@ -15,6 +15,9 @@ const ArticlesPage = {
     keyword: '',
     downloadTaskId: null,
     _pollTimer: null,
+    _listRequestId: 0,
+    _listLoading: false,
+    _listLoaded: false,
 
     render() {
         return `
@@ -148,6 +151,7 @@ const ArticlesPage = {
     },
 
     destroy() {
+        this._listRequestId++;
         if (this._pollTimer) {
             clearInterval(this._pollTimer);
             this._pollTimer = null;
@@ -182,6 +186,12 @@ const ArticlesPage = {
     },
 
     async selectAccount(fakeid, name) {
+        this._listRequestId++;
+        this._listLoading = false;
+        this._listLoaded = false;
+        this.articles = [];
+        this.total = 0;
+        this.canMsgContinue = 0;
         this.currentFakeid = fakeid;
         this.currentName = name;
         this.currentPage = 0;
@@ -208,10 +218,22 @@ const ArticlesPage = {
         this.updateSelectedCount();
         this.updateModeUI();
 
-        await this.loadArticles();
+        this.clearDateFilter();
+        this.renderListPrompt();
+    },
+
+    renderListPrompt() {
+        document.getElementById('articles-pagination').style.display = 'none';
+        document.getElementById('articles-list').innerHTML = `
+            <div class="empty-state">
+                <p class="empty-state-desc">选择日期后点击“按时间下载”，系统才会获取文章并下载。单篇或多选下载可先手动加载列表。</p>
+                <button class="btn btn-secondary" onclick="ArticlesPage.loadArticles()">加载文章列表</button>
+            </div>`;
     },
 
     async loadArticles() {
+        if (!this.currentFakeid || this._listLoading) return;
+        const requestId = ++this._listRequestId;
         const container = document.getElementById('articles-list');
 
         // ⚡ 1. 内存缓存检查：已加载过的数据直接调取，无需重复请求接口
@@ -226,12 +248,16 @@ const ArticlesPage = {
             return;
         }
 
+        this._listLoading = true;
         container.innerHTML = '<div class="loading-screen" style="min-height: 200px;"><div class="spinner"></div><p>加载文章列表...</p></div>';
 
         try {
             const begin = this.currentPage * this.pageSize;
             const data = await API.articles.list(this.currentFakeid, begin, this.pageSize, this.keyword);
 
+            if (requestId !== this._listRequestId) return;
+            if (data.error || data.need_verify) throw new Error(data.error || '触发安全验证，请完成验证后重试');
+            this._listLoaded = true;
             this.articles = data.articles || [];
             this.total = data.total || 0;
             this.canMsgContinue = data.can_msg_continue !== undefined ? data.can_msg_continue : (this.articles.length > 0 ? 1 : 0);
@@ -253,9 +279,10 @@ const ArticlesPage = {
             this.updatePagination();
             this.updateSelectedCount();
         } catch (err) {
+            if (requestId !== this._listRequestId) return;
             const isWaterwall = err.message && (err.message.includes('防水墙') || err.message.includes('安全验证') || err.message.includes('tcaptcha') || err.message.includes('人机验证'));
             const isAuthError = !isWaterwall && err.message && (err.message.includes('失效') || err.message.includes('未找到有效凭证') || err.message.includes('ret=-3') || err.message.includes('401') || err.message.includes('过期') || err.message.includes('会话'));
-            const accountName = this.currentAccount ? (this.currentAccount.nickname || '') : '';
+            const accountName = this.currentName;
             
             if (isWaterwall) {
                 container.innerHTML = `
@@ -288,6 +315,8 @@ const ArticlesPage = {
                     </div>
                 `;
             }
+        } finally {
+            if (requestId === this._listRequestId) this._listLoading = false;
         }
     },
 
@@ -317,7 +346,7 @@ const ArticlesPage = {
         if (mode === 'single') {
             this.selectedArticles.clear();
         }
-        this.renderArticles();
+        if (this._listLoaded) this.renderArticles();
         this.updateModeUI();
         this.updateSelectedCount();
     },
@@ -482,6 +511,8 @@ const ArticlesPage = {
     },
 
     searchArticles() {
+        this._listRequestId++;
+        this._listLoading = false;
         const input = document.getElementById('search-article-input');
         this.keyword = input?.value.trim() || '';
         this.currentPage = 0;
@@ -502,7 +533,12 @@ const ArticlesPage = {
         this.selectedArticles.clear();
         this.pageCache = {};
         this.loadedArticlesMap.clear();
-        this.loadArticles();
+        this._listRequestId++;
+        this._listLoading = false;
+        this._listLoaded = false;
+        this.articles = [];
+        this.updateSelectedCount();
+        this.renderListPrompt();
     },
 
     onQuickDateChange(type) {
@@ -630,14 +666,14 @@ const ArticlesPage = {
     },
 
     prevPage() {
-        if (this.currentPage > 0) {
+        if (!this._listLoading && this.currentPage > 0) {
             this.currentPage--;
             this.loadArticles();
         }
     },
 
     nextPage() {
-        if (this.articles.length > 0) {
+        if (!this._listLoading && this.canMsgContinue && this.articles.length > 0) {
             this.currentPage++;
             this.loadArticles();
         }
