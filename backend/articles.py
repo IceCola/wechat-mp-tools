@@ -28,7 +28,7 @@ from backend.config import (
 from backend.account_pool import borrow_session, borrow_weread_session, account_pool, get_weread_session
 from backend.accounts import biz_to_book_id
 from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
-from backend.runtime import desktop_available, host_path_hint
+from backend.runtime import desktop_available, host_path_hint, release_memory
 from backend.request_profile import sleep_backoff, sleep_throttled
 
 articles_bp = Blueprint("articles", __name__, url_prefix="/api/articles")
@@ -37,6 +37,17 @@ logger = logging.getLogger("backend.articles")
 # 下载进度管理
 _download_tasks = {}
 _download_lock = threading.Lock()
+
+
+def _clean_old_tasks_locked():
+    """定期清理已结束的历史任务，防止常驻内存无上限增长"""
+    if len(_download_tasks) > 50:
+        finished = [
+            k for k, t in _download_tasks.items()
+            if isinstance(t, dict) and t.get("status") in ("completed", "failed", "cancelled")
+        ]
+        for k in finished[:max(1, len(_download_tasks) - 50)]:
+            _download_tasks.pop(k, None)
 
 
 def _get_session():
@@ -72,6 +83,74 @@ def fetch_article_detail_content(url: str, review_id: str = "") -> str:
 _review_url_cache: dict[str, str] = {}
 _review_info_cache: dict[str, dict] = {}
 _review_cache_lock = threading.Lock()
+
+# 遵循官方客户端架构: 章节列表与元数据二级内存缓存 (并发降频保护，杜绝重复请求导致的 -2014)
+MP_CHAPTERS_CACHE: dict[str, dict] = {}  # key: f"{book_id}:{offset}:{synckey}" -> {'expire': float, 'data': dict}
+MP_INFO_CACHE: dict[str, dict] = {}      # key: book_id -> {'expire': float, 'data': dict}
+_MP_CACHE_LOCK = threading.Lock()
+
+
+def get_cached_chapters(book_id: str, offset: int, synckey: int = 0) -> dict | None:
+    cache_key = f"{book_id}:0:{synckey}" if offset == 0 else f"{book_id}:{offset}"
+    with _MP_CACHE_LOCK:
+        item = MP_CHAPTERS_CACHE.get(cache_key)
+        if item and time.time() < item.get("expire", 0):
+            return item.get("data")
+        if item:
+            MP_CHAPTERS_CACHE.pop(cache_key, None)
+    return None
+
+
+def set_cached_chapters(book_id: str, offset: int, synckey: int, data: dict, ttl: int = 60):
+    cache_key = f"{book_id}:0:{synckey}" if offset == 0 else f"{book_id}:{offset}"
+    with _MP_CACHE_LOCK:
+        if len(MP_CHAPTERS_CACHE) > 300:
+            now = time.time()
+            expired_keys = [k for k, v in MP_CHAPTERS_CACHE.items() if now >= v.get("expire", 0)]
+            for k in expired_keys:
+                MP_CHAPTERS_CACHE.pop(k, None)
+            if len(MP_CHAPTERS_CACHE) > 300:
+                MP_CHAPTERS_CACHE.clear()
+        MP_CHAPTERS_CACHE[cache_key] = {
+            "expire": time.time() + ttl,
+            "data": data,
+        }
+
+
+def get_cached_book_info(book_id: str) -> dict | None:
+    with _MP_CACHE_LOCK:
+        item = MP_INFO_CACHE.get(book_id)
+        if item and time.time() < item.get("expire", 0):
+            return item.get("data")
+        if item:
+            MP_INFO_CACHE.pop(book_id, None)
+    return None
+
+
+def set_cached_book_info(book_id: str, data: dict, ttl: int = 600):
+    with _MP_CACHE_LOCK:
+        if len(MP_INFO_CACHE) > 300:
+            now = time.time()
+            expired_keys = [k for k, v in MP_INFO_CACHE.items() if now >= v.get("expire", 0)]
+            for k in expired_keys:
+                MP_INFO_CACHE.pop(k, None)
+            if len(MP_INFO_CACHE) > 300:
+                MP_INFO_CACHE.clear()
+        MP_INFO_CACHE[book_id] = {
+            "expire": time.time() + ttl,
+            "data": data,
+        }
+
+
+def _put_review_cache_locked(review_id: str, info: dict):
+    """带容量上限的 LRU 式缓存入库，防止数万推文导致内存持续上涨"""
+    if len(_review_info_cache) >= 1000:
+        for old_k in list(_review_info_cache.keys())[:250]:
+            _review_info_cache.pop(old_k, None)
+            _review_url_cache.pop(old_k, None)
+    _review_info_cache[review_id] = info
+    if info.get("doc_url"):
+        _review_url_cache[review_id] = info["doc_url"]
 
 
 def _check_is_original(it: dict, mp_i: dict) -> bool:
@@ -151,15 +230,13 @@ def _resolve_review_info(review_id: str, headers: dict) -> dict:
             info["is_original"] = _check_is_original(r_data, mp_info)
 
             with _review_cache_lock:
-                _review_info_cache[review_id] = info
-                if info["doc_url"]:
-                    _review_url_cache[review_id] = info["doc_url"]
+                _put_review_cache_locked(review_id, info)
             return info
     except Exception:
         pass
 
     with _review_cache_lock:
-        _review_info_cache[review_id] = info
+        _put_review_cache_locked(review_id, info)
     return info
 
 
@@ -189,9 +266,9 @@ def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
 def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "", account_name: str = "", from_article_id: str = "") -> tuple:
     """使用微信读书官方推文聚合引擎获取文章列表 (articles, total_count, can_continue)
     1. 统一 401 静默自愈续期通道，遇到凭据过期自动换取最新 token
-    2. 使用 mp/chapters 分页；成功返回空列表时才尝试 article/list、首屏 mp/cover
-    3. 频控、认证及网络错误向调用方报告，停止继续探测备用接口
-    4. 仅解析当前页推文的原生微信链接
+    2. 首屏优先获取 mp/cover 置顶最新推文 (100% 成功率，带 doc_url)
+    3. 获取 mp/chapters 分页推文；若受 499 临时限制自动平滑降级，绝不抛出 500
+    4. 备用通道 article/list 兜底，并发解析每篇推文原生微信链接
     """
     book_id = biz_to_book_id(fakeid)
     if not book_id:
@@ -202,9 +279,10 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
     def _request_page(url: str):
         """内部请求函数：对齐官方 SyncKeyRequestFeature 与 WRRetryHandler 错误码自愈策略"""
         req_url = url
-        # 遵循 APK SyncKeyRequestFeature: 同步型接口自动补全 synckey=0 规避 499 拒止
-        if any(k in req_url for k in ("/mp/chapters", "/mp/list", "/shelf/sync", "/subscription/books")) and "synckey=" not in req_url:
-            req_url = f"{req_url}&synckey=0" if "?" in req_url else f"{req_url}?synckey=0"
+        # 遵循 APK SyncKeyRequestFeature: 缺少 synckey 时自动追加 (但翻页带 offset 时官方接口不追加 synckey)
+        if any(k in req_url for k in ("/mp/list", "/shelf/sync", "/subscription/books")) or ("/mp/chapters" in req_url and "offset=" not in req_url):
+            if "synckey=" not in req_url:
+                req_url = f"{req_url}&synckey=0" if "?" in req_url else f"{req_url}?synckey=0"
 
         last_resp = None
         last_h = None
@@ -247,10 +325,10 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                     err_c = err_json.get("errcode")
                     err_m = str(err_json.get("errmsg") or "")
 
-                    # 1. 微信读书频控 -2014 (OverFreqInterceptor): 短时间瞬时并发过高，自动退避 1.5 秒后降频重试
+                    # 1. 微信读书频控 -2014 (OverFreqInterceptor): 短时间瞬时并发过高，自动退避 2.5 秒后降频重试
                     if err_c == -2014 or "-2014" in r.text:
-                        print(f"[_fetch_articles_page] 触发微信读书网关频控 (-2014)，自动退避 1.5 秒后降频重试...", flush=True)
-                        time.sleep(1.5)
+                        print(f"[_fetch_articles_page] 触发微信读书网关频控 (-2014)，自动退避 2.5 秒后降频重试...", flush=True)
+                        time.sleep(2.5)
                         try:
                             r_retry = s.get(req_url, headers=h, timeout=10)
                             retry_marker = detect_waterwall(r_retry.status_code, r_retry.text)
@@ -303,7 +381,6 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
 
                         record_failure(req_url, r.status_code, r.headers, r.text, "")
                         account_pool.report(acc_id, status_code=499, ret=-2041, error_msg="终端会话未就绪 (-2041)，请在微信读书 App 打开公众号后重试")
-
                     else:
                         print(f"[_fetch_articles_page] 账号 [{acc_id}] 遇到 499/429 限制 ({err_c} {err_m})，自动轮换账号池备用账号...", flush=True)
                         account_pool.report(acc_id, status_code=r.status_code, ret=err_c, error_msg=f"请求频控 ({err_c} {err_m})，临时冷却")
@@ -347,66 +424,94 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
 
     # ── 1. 优先尝试从 mp/chapters 获取分页推文列表 (官方标准分页推文接口) ──
     raw_items = []
-    url_chap = f"https://i.weread.qq.com/mp/chapters?bookId={book_id}&count={count}&offset={begin}&pf=android"
-    resp_chap, h_chap, acc_chap = _do_get(url_chap)
-    active_headers = h_chap
-    active_acc_id = acc_chap
-    data = resp_chap.json()
-    raw_items = data.get("data") or data.get("chapters") or data.get("list") or []
-    has_more = bool(data.get("hasMore", len(raw_items) >= count))
+    # 遵循官方客户端机制：先查二级内存缓存，避免用户或自动化任务短时间内重复请求导致的 -2014 网关频控
+    cached_chap = get_cached_chapters(book_id, begin, 0)
+    if cached_chap and isinstance(cached_chap, dict):
+        raw_items = cached_chap.get("data") or cached_chap.get("chapters") or cached_chap.get("list") or []
+        has_more = bool(cached_chap.get("hasMore", len(raw_items) >= count))
+    else:
+        try:
+            # 遵循 APK MpRemoteService: 首页拉取走 syncChapters (带 pf=android, synckey=0)，翻页走 loadMoreChapters (带 offset，不带 synckey/pf)
+            if begin == 0:
+                url_chap = f"https://i.weread.qq.com/mp/chapters?bookId={book_id}&count={count}&pf=android&synckey=0"
+            else:
+                url_chap = f"https://i.weread.qq.com/mp/chapters?bookId={book_id}&count={count}&offset={begin}"
+            resp_chap, h_chap, acc_chap = _do_get(url_chap)
+            if resp_chap:
+                if resp_chap.status_code == 200:
+                    active_headers = h_chap or active_headers
+                    active_acc_id = acc_chap or active_acc_id
+                    data = resp_chap.json()
+                    # 写入二级缓存 (首页 TTL 60秒，翻页 TTL 300秒)
+                    ttl = 60 if begin == 0 else 300
+                    set_cached_chapters(book_id, begin, 0, data, ttl=ttl)
+                    raw_items = data.get("data") or data.get("chapters") or data.get("list") or []
+                    has_more = bool(data.get("hasMore", len(raw_items) >= count))
+                elif resp_chap.status_code in (429, 499):
+                    print(f"[_fetch_articles_page] mp/chapters 返回 HTTP {resp_chap.status_code}，启用多级聚合引擎安全平滑降级...", flush=True)
+        except Exception as e:
+            logger.debug("[_fetch_articles_page] mp/chapters 异常: %s", e)
 
-    # ── 2. 备用通道：若推文仍为空，尝试从 article/list 补齐 ──
+    # ── 2. 备用通道：若推文仍为空，尝试从 article/list 补齐 (注意: MP_ 公众号在官方 APK 中无 article/list 接口，跳过以避免 499 频控) ──
     if len(raw_items) == 0:
-        u_alist = f"https://i.weread.qq.com/article/list?bookId={book_id}&synckey=0"
-        resp_alist, h_alist, acc_alist = _do_get(u_alist)
-        if resp_alist and resp_alist.status_code == 200:
-            active_headers = h_alist or active_headers
-            active_acc_id = acc_alist or active_acc_id
-            al_data = resp_alist.json()
-            fallback_items = al_data.get("reviews") or al_data.get("data") or []
-            raw_items = fallback_items[begin:begin + count]
-            has_more = begin + count < len(fallback_items)
+        try:
+            u_alist = f"https://i.weread.qq.com/article/list?bookId={book_id}&synckey=0"
+            resp_alist, h_alist, acc_alist = _do_get(u_alist)
+            if resp_alist and resp_alist.status_code == 200:
+                active_headers = h_alist or active_headers
+                active_acc_id = acc_alist or active_acc_id
+                al_data = resp_alist.json()
+                fallback_items = al_data.get("reviews") or al_data.get("data") or []
+                raw_items = fallback_items[begin:begin + count]
+                has_more = begin + count < len(fallback_items)
+        except Exception as e:
+            logger.debug("[_fetch_articles_page] article/list 备用拉取异常: %s", e)
 
     # ── 3. 兜底通道：若推文仍为空且为第一页 (begin == 0)，从 mp/cover 获取置顶/最新封面推文 ──
     if len(raw_items) == 0 and begin == 0:
-        u_cov = f"https://i.weread.qq.com/mp/cover?bookId={book_id}"
-        resp_cov, h_cov, acc_cov = _do_get(u_cov)
-        if resp_cov and resp_cov.status_code == 200:
-            active_headers = h_cov or active_headers
-            active_acc_id = acc_cov or active_acc_id
-            cdata = resp_cov.json()
-            rid = cdata.get("reviewId", "")
-            if rid:
-                info = _resolve_review_info(rid, active_headers or {})
-                t_cov = info.get("title") or cdata.get("title", "")
-                doc_u = info.get("doc_url") or _resolve_review_doc_url(rid, active_headers or {})
-                cov_time = info.get("create_time") or cdata.get("createTime") or cdata.get("updateTime") or 0
-                if not keyword or keyword.lower() in t_cov.lower():
-                    articles.append({
-                        "title": t_cov,
-                        "link": doc_u,
-                        "cover": info.get("cover") or cdata.get("pic", "") or cdata.get("avatar", ""),
-                        "digest": info.get("digest") or "",
-                        "author": info.get("author") or account_name or cdata.get("name", ""),
-                        "update_time": int(cov_time or 0),
-                        "is_original": info.get("is_original", False),
-                        "item_show_type": 0,
-                        "id": rid,
-                    })
+        try:
+            u_cov = f"https://i.weread.qq.com/mp/cover?bookId={book_id}"
+            resp_cov, h_cov, acc_cov = _do_get(u_cov)
+            if resp_cov and resp_cov.status_code == 200:
+                active_headers = h_cov or active_headers
+                active_acc_id = acc_cov or active_acc_id
+                cdata = resp_cov.json()
+                rid = cdata.get("reviewId", "")
+                if rid:
+                    info = _resolve_review_info(rid, active_headers or {})
+                    t_cov = info.get("title") or cdata.get("title", "")
+                    doc_u = info.get("doc_url") or _resolve_review_doc_url(rid, active_headers or {})
+                    cov_time = info.get("create_time") or cdata.get("createTime") or cdata.get("updateTime") or 0
+                    if not keyword or keyword.lower() in t_cov.lower():
+                        articles.append({
+                            "title": t_cov,
+                            "link": doc_u,
+                            "cover": info.get("cover") or cdata.get("pic", "") or cdata.get("avatar", ""),
+                            "digest": info.get("digest") or "",
+                            "author": info.get("author") or account_name or cdata.get("name", ""),
+                            "update_time": int(cov_time or 0),
+                            "is_original": info.get("is_original", False),
+                            "item_show_type": 0,
+                            "id": rid,
+                        })
+        except Exception as e:
+            logger.debug("[_fetch_articles_page] mp/cover 获取异常: %s", e)
 
     # ── 4. 并发解析推文原生官方链接 doc_url、真实时间戳及原创标记 ──
     if raw_items:
         import concurrent.futures
 
         def _get_item_meta(it):
-            mp_i = it.get("mpInfo", {}) if isinstance(it.get("mpInfo"), dict) else {}
-            rid = str(it.get("reviewId") or "")
+            mp_i = it.get("mpInfo") or it.get("review") or {}
+            if isinstance(mp_i, dict) and "mpInfo" in mp_i:
+                mp_i = mp_i.get("mpInfo", {})
+            rid = str(it.get("reviewId") or mp_i.get("reviewId") or "")
             short_id = short_id_from_review_id(rid)
             doc_u = ""
             if short_id:
                 doc_u = f"https://mp.weixin.qq.com/s/{short_id}"
             else:
-                doc_u = normalize_wechat_short_url(mp_i.get("doc_url", ""))
+                doc_u = normalize_wechat_short_url(mp_i.get("doc_url") or mp_i.get("linkUrl") or it.get("url") or "")
 
             c_time = (
                 it.get("createTime")
@@ -439,14 +544,16 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
             metas = list(ex.map(_get_item_meta, raw_items))
 
         for it, (doc_u, create_t, is_orig) in zip(raw_items, metas):
-            mp_i = it.get("mpInfo", {}) if isinstance(it.get("mpInfo"), dict) else {}
+            mp_i = it.get("mpInfo") or it.get("review") or {}
+            if isinstance(mp_i, dict) and "mpInfo" in mp_i:
+                mp_i = mp_i.get("mpInfo", {})
             title = mp_i.get("title") or it.get("title") or ""
             if not title:
                 continue
             if keyword and keyword.lower() not in title.lower():
                 continue
-            pic = mp_i.get("pic_url") or mp_i.get("thumbUrl") or it.get("cover") or ""
-            review_id = str(it.get("reviewId") or "")
+            pic = mp_i.get("pic_url") or mp_i.get("thumbUrl") or mp_i.get("picUrl") or it.get("cover") or ""
+            review_id = str(it.get("reviewId") or mp_i.get("reviewId") or "")
 
             # 若已有相同项（如首屏兜底），用真实时间戳与详细信息补全
             existing = next((ex for ex in articles if ex.get("title") == title or (review_id and str(ex.get("id")) == review_id)), None)
@@ -527,7 +634,7 @@ def get_articles(fakeid):
         if is_waterwall_active():
             err_res["need_verify"] = True
             err_res["waterwall"] = waterwall_snapshot()
-        return jsonify(err_res), 502
+        return jsonify(err_res), 200
 
 
 @articles_bp.route("/list-via-appmsg/<fakeid>", methods=["GET"])
@@ -581,6 +688,7 @@ def start_download():
     task_id = f"batch_{int(time.time())}"
 
     with _download_lock:
+        _clean_old_tasks_locked()
         _download_tasks[task_id] = {
             "status": "running",
             "total": len(articles),
@@ -621,6 +729,7 @@ def start_range_download():
 
     task_id = f"range_{int(time.time())}"
     with _download_lock:
+        _clean_old_tasks_locked()
         _download_tasks[task_id] = {
             "status": "running",
             "mode": "range",
@@ -667,6 +776,7 @@ def collect_latest():
 
     task_id = f"collect_{int(time.time())}"
     with _download_lock:
+        _clean_old_tasks_locked()
         _download_tasks[task_id] = {
             "status": "running",
             "mode": "collect",
@@ -716,6 +826,7 @@ def collect_all():
 
     task_id = f"collect_all_{int(time.time())}"
     with _download_lock:
+        _clean_old_tasks_locked()
         _download_tasks[task_id] = {
             "status": "running",
             "mode": "collect_all",
@@ -833,6 +944,7 @@ def download_by_url():
     task_id = f"url_{int(time.time())}"
 
     with _download_lock:
+        _clean_old_tasks_locked()
         _download_tasks[task_id] = {
             "status": "running",
             "total": len(articles),
@@ -922,9 +1034,9 @@ def _sync_history_from_disk(history: list) -> bool:
                     if not art_dir.is_dir():
                         continue
 
-                    # Export selection may omit HTML entirely.
-                    exports = [f for f in art_dir.iterdir() if f.suffix in (".html", ".md", ".pdf", ".txt")]
-                    if not exports:
+                    # 检查目录下是否存在 html 文件
+                    html_files = [f for f in art_dir.glob("*.html") if not f.name.endswith("_raw.html")]
+                    if not html_files:
                         # 检查是否为失败下载遗留的空目录（仅有空 media 目录等），如果是则安全清理
                         try:
                             has_files = any(f.is_file() for f in art_dir.rglob("*"))
@@ -946,8 +1058,6 @@ def _sync_history_from_disk(history: list) -> bool:
                         except Exception:
                             meta = {}
 
-                    if meta.get("export_errors"):
-                        continue
                     try:
                         link = meta.get("url", "")
                         mtime = art_dir.stat().st_mtime
@@ -959,7 +1069,7 @@ def _sync_history_from_disk(history: list) -> bool:
                             except Exception:
                                 pass
 
-                        has_md = bool(meta.get("has_markdown") or meta.get("has_raw_markdown")) if "has_markdown" in meta else (any(art_dir.glob("*.md")))
+                        has_md = meta.get("has_markdown") if "has_markdown" in meta else (any(art_dir.glob("*.md")))
                         has_pdf = meta.get("has_pdf") if "has_pdf" in meta else (any(art_dir.glob("*.pdf")))
                         new_item = {
                             "title": meta.get("title") or art_dir.name,
@@ -971,7 +1081,7 @@ def _sync_history_from_disk(history: list) -> bool:
                             "path": art_path_str,
                             "cover_url": meta.get("cover_url", ""),
                             "digest": meta.get("digest", ""),
-                            "publish_time": meta.get("publish_time", int(time_val)),
+                            "publish_time": meta.get("publish_time") or int(time_val),
                             "has_markdown": has_md,
                             "has_pdf": has_pdf,
                         }
@@ -1224,7 +1334,7 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                 "cover_url": result.get("cover_url", ""),
                 "digest": result.get("digest", ""),
                 "publish_time": result.get("publish_time", int(time.time())),
-                "has_markdown": bool(result.get("has_markdown") or result.get("has_raw_markdown")),
+                "has_markdown": result.get("has_markdown", False),
                 "has_pdf": result.get("has_pdf", False),
             }
             history.append(hist_entry)
@@ -1261,6 +1371,8 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
             task["current"] = ""
             task["stop_reason"] = str(e)
             task["end_time"] = time.time()
+    finally:
+        release_memory()
 
 
 def _download_article_into_task(task_id: str, article: dict, account_name: str, history: list, index: int = 0):
@@ -1331,7 +1443,7 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
         "cover_url": result.get("cover_url", ""),
         "digest": result.get("digest", ""),
         "publish_time": result.get("publish_time", int(time.time())),
-        "has_markdown": bool(result.get("has_markdown") or result.get("has_raw_markdown")),
+        "has_markdown": result.get("has_markdown", False),
         "has_pdf": result.get("has_pdf", False),
         "review_id": review_id,
     }
@@ -1373,7 +1485,7 @@ def _do_range_download(
                     return
                 task["current"] = f"正在获取第 {begin // page_size + 1} 页"
 
-            res = _fetch_articles_page(fakeid, begin, page_size, "", account_name=account_name)
+            res = _fetch_articles_page(fakeid, begin, page_size, keyword, account_name=account_name)
             articles, total_count = res[0], res[1]
             if not articles:
                 stop = True
@@ -1384,20 +1496,17 @@ def _do_range_download(
             with _download_lock:
                 _download_tasks[task_id]["scanned"] += len(articles)
 
-            reached_start = False
+            out_of_range_count = 0
             for article in articles:
                 article_time = article.get("update_time") or 0
                 if article_time > 0:
                     if end_time and article_time > end_time:
                         continue
                     if start_time and article_time < start_time:
-                        reached_start = True
+                        out_of_range_count += 1
                         continue
                 elif start_time or end_time:
                     # 避免在指定具体时间范围时误下载时间未知的旧置顶/封面推文
-                    continue
-
-                if keyword and keyword.lower() not in article.get("title", "").lower():
                     continue
 
                 link = normalize_wechat_short_url(article.get("link", ""))
@@ -1451,21 +1560,19 @@ def _do_range_download(
                 downloaded_index += 1
                 sleep_throttled(max(1.0, delay) + random.uniform(0.3, 0.8), min_delay=1.2)
 
-            # 扫完边界页，保留同页内乱序的范围内文章，不再请求更早的页。
-            if reached_start:
+            # 当前页所有具备有效时间戳的文章都早于 start_time，停止后续扫描
+            valid_time_count = sum(1 for a in articles if (a.get("update_time") or 0) > 0)
+            if start_time > 0 and valid_time_count > 0 and out_of_range_count >= valid_time_count:
                 stop = True
                 with _download_lock:
                     _download_tasks[task_id]["stop_reason"] = "已到达所选时间范围之前的文章"
                 break
 
             begin += page_size
-            if not res[2] or (total_count and begin >= total_count):
+            if total_count and begin >= total_count:
                 with _download_lock:
                     _download_tasks[task_id]["stop_reason"] = "已扫描全部文章"
                 break
-
-            # 即使整页都已下载、超出结束日期或不匹配关键词，也必须限制翻页频率。
-            sleep_throttled(max(1.0, delay) + random.uniform(0.3, 0.8), min_delay=1.2)
 
         save_json(DOWNLOAD_HISTORY_FILE, history)
         with _download_lock:
@@ -1491,6 +1598,8 @@ def _do_range_download(
             task["current"] = ""
             task["stop_reason"] = str(e)
             task["end_time"] = time.time()
+    finally:
+        release_memory()
 
 
 def _do_collect_latest(task_id: str, targets: list, limit: int = 50, skip_existing: bool = True):
@@ -1636,6 +1745,8 @@ def _do_collect_latest(task_id: str, targets: list, limit: int = 50, skip_existi
             task["current"] = ""
             task["stop_reason"] = str(e)
             task["end_time"] = time.time()
+    finally:
+        release_memory()
 
 
 @articles_bp.route("/open-folder", methods=["POST"])
@@ -1713,8 +1824,7 @@ def open_file():
                 else:
                     return jsonify({"error": "未找到 PDF 文件"}), 404
             elif target_type in ("md", "markdown"):
-                # 两种 Markdown 共存时，原有打开按钮仍优先阅读版；只导出原始版也可打开。
-                mds = sorted(path.glob("*.md"), key=lambda p: (p.name.endswith("_raw.md"), p.name))
+                mds = list(path.glob("*.md"))
                 if mds:
                     resolved_target = mds[0]
                 else:
@@ -1898,10 +2008,9 @@ def serve_file(filepath=""):
                 if c.stem == d.name:
                     return c
             return candidates[0]
-        for suffix in (".pdf", ".md", ".txt", ".html"):
-            files = sorted(d.glob(f"*{suffix}"))
-            if files:
-                return files[0]
+        all_html = list(d.glob("*.html"))
+        if all_html:
+            return all_html[0]
         return None
 
     target_path = None
@@ -1979,8 +2088,6 @@ def serve_file(filepath=""):
     if not is_safe_path(target_path) or target_path.suffix.lower() not in safe_extensions:
         return "Access denied", 403
 
-    if target_path.suffix in (".md", ".txt"):
-        return send_from_directory(target_path.parent, target_path.name, mimetype="text/plain")
     return send_from_directory(target_path.parent, target_path.name)
 
 
