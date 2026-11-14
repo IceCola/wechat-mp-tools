@@ -22,7 +22,6 @@ WATERWALL_MARKERS = (
     "请完成验证",
     "risk_control",
     "verify_code",
-    "-2041",
 )
 
 WATERWALL = {

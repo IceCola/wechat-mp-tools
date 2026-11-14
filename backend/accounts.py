@@ -192,9 +192,8 @@ def search_accounts():
                     from backend.weread_signer import activate_terminal_session
                     activate_terminal_session(headers, session=s)
                 elif "-2014" in err_text:
-                    from backend.waterwall import waterwall_hit, record_failure
-                    record_failure(url_mp, resp.status_code, resp.headers, resp.text, "-2014")
-                    waterwall_hit(url_mp, resp.status_code, "-2014")
+                    from backend.waterwall import record_failure
+                    record_failure(url_mp, resp.status_code, resp.headers, resp.text, "")
                     account_pool.report(acc_id, status_code=499, ret=-2014, error_msg="频控 -2014")
                     acc_id, vid, token, headers = borrow_weread_session()
                 else:

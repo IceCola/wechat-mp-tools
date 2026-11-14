@@ -53,6 +53,10 @@ const AccountsPage = {
         await this.loadAccounts();
     },
 
+    async onShow() {
+        await this.loadAccounts();
+    },
+
     async loadAccounts() {
         try {
             const data = await API.accounts.list();

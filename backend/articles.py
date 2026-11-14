@@ -213,6 +213,8 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
             try:
                 acc_id, vid, tok, h = borrow_weread_session()
             except RuntimeError as e:
+                if last_resp is not None:
+                    return last_resp, last_h, last_acc
                 raise RuntimeError("账号池中无可用微信读书账号，请先在『账号池』页面扫码登录") from e
             last_h = h
             last_acc = acc_id
@@ -251,17 +253,19 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                         time.sleep(1.5)
                         try:
                             r_retry = s.get(req_url, headers=h, timeout=10)
-                            if r_retry.status_code == 200:
+                            retry_marker = detect_waterwall(r_retry.status_code, r_retry.text)
+                            if retry_marker:
+                                record_failure(req_url, r_retry.status_code, r_retry.headers, r_retry.text, retry_marker)
+                                waterwall_hit(req_url, r_retry.status_code, retry_marker)
+                                return r_retry, h, acc_id
+                            if r_retry.status_code == 200 and not r_retry.json().get("errcode"):
                                 return r_retry, h, acc_id
                         except Exception as ex_retry:
                             logger.debug("频控退避重试网络异常: %s", ex_retry)
 
-                        # 退避重试后依然触发 -2014 频控：激活腾讯防水墙/频控熔断并触发前端验证
-                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 退避重试后仍处于高频风控 (-2014)，激活防水墙与熔断保护...", flush=True)
-                        record_failure(req_url, r.status_code, r.headers, r.text, "-2014")
-                        waterwall_hit(req_url, r.status_code, "-2014")
-                        account_pool.report(acc_id, status_code=499, ret=-2014, error_msg="触发高频风控 (-2014)，临时冷却并建议完成安全验证")
-                        return r, h, acc_id
+                        # 普通限流只冷却当前账号，不触发全局验证码状态。
+                        record_failure(req_url, r.status_code, r.headers, r.text, "")
+                        account_pool.report(acc_id, status_code=499, ret=-2014, error_msg="请求限流 (-2014)，临时冷却 30 秒后重试")
 
                     # 2. 网关超时 -2012 (对齐 WRRetryHandler.canRetryTimeOut / whetherNeedToRetry 策略)
                     elif err_c == -2012 or "-2012" in r.text:
@@ -269,7 +273,12 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                         time.sleep(0.5)
                         try:
                             r_retry = s.get(req_url, headers=h, timeout=10)
-                            if r_retry.status_code == 200:
+                            retry_marker = detect_waterwall(r_retry.status_code, r_retry.text)
+                            if retry_marker:
+                                record_failure(req_url, r_retry.status_code, r_retry.headers, r_retry.text, retry_marker)
+                                waterwall_hit(req_url, r_retry.status_code, retry_marker)
+                                return r_retry, h, acc_id
+                            if r_retry.status_code == 200 and not r_retry.json().get("errcode"):
                                 return r_retry, h, acc_id
                         except Exception:
                             pass
@@ -281,18 +290,20 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                         if activate_terminal_session(h, session=s):
                             try:
                                 r_retry = s.get(req_url, headers=h, timeout=10)
-                                if r_retry.status_code == 200:
+                                retry_marker = detect_waterwall(r_retry.status_code, r_retry.text)
+                                if retry_marker:
+                                    record_failure(req_url, r_retry.status_code, r_retry.headers, r_retry.text, retry_marker)
+                                    waterwall_hit(req_url, r_retry.status_code, retry_marker)
+                                    return r_retry, h, acc_id
+                                if r_retry.status_code == 200 and not r_retry.json().get("errcode"):
                                     print(f"[_fetch_articles_page] 账号 [{acc_id}] 移动端会话同步激活成功，重试请求通过！", flush=True)
                                     return r_retry, h, acc_id
                             except Exception as ex:
                                 logger.debug("重试请求异常: %s", ex)
 
-                        # 若移动会话已激活但仍返回 -2041，确定触发官方 TCaptcha 人机验证，唤起前端滑块弹窗！
-                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 移动会话已激活但仍返回 -2041，确认为官方强制 TCaptcha 人机验证！", flush=True)
-                        record_failure(req_url, r.status_code, r.headers, r.text, "-2041")
-                        waterwall_hit(req_url, r.status_code, "-2041")
-                        account_pool.report(acc_id, status_code=499, ret=-2041, error_msg="触发腾讯人机验证 (-2041)，需在网页完成滑块验证")
-                        return r, h, acc_id
+                        record_failure(req_url, r.status_code, r.headers, r.text, "")
+                        account_pool.report(acc_id, status_code=499, ret=-2041, error_msg="终端会话未就绪 (-2041)，请在微信读书 App 打开公众号后重试")
+
                     else:
                         print(f"[_fetch_articles_page] 账号 [{acc_id}] 遇到 499/429 限制 ({err_c} {err_m})，自动轮换账号池备用账号...", flush=True)
                         account_pool.report(acc_id, status_code=r.status_code, ret=err_c, error_msg=f"请求频控 ({err_c} {err_m})，临时冷却")
@@ -308,13 +319,22 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
 
     def _do_get(url: str):
         response, headers, account_id = _request_page(url)
-        from backend.waterwall import is_waterwall_active
-        if is_waterwall_active():
-            raise PermissionError("触发频控或安全验证，请完成验证后重试")
+        from backend.waterwall import detect_waterwall
         if response is None:
             raise RuntimeError("文章列表请求失败，请稍后重试")
+        if detect_waterwall(response.status_code, response.text):
+            raise PermissionError("上游返回安全验证，请完成验证后重试")
         if response.status_code != 200:
-            raise RuntimeError(f"文章列表请求失败 (HTTP {response.status_code})，请稍后重试")
+            try:
+                error = response.json()
+            except ValueError:
+                error = {}
+            code = error.get("errcode")
+            if code == -2014:
+                raise RuntimeError("微信读书请求限流 (-2014)，请等待 30 秒后重试")
+            if code == -2041:
+                raise RuntimeError("微信读书终端会话未就绪 (-2041)，请在微信读书 App 打开公众号后重试")
+            raise RuntimeError(f"文章列表请求失败 (HTTP {response.status_code}, errcode={code})，请稍后重试")
         data = response.json()
         if data.get("errcode"):
             raise RuntimeError(f"文章列表请求失败: {data.get('errmsg') or data['errcode']}")
@@ -336,8 +356,7 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
     has_more = bool(data.get("hasMore", len(raw_items) >= count))
 
     # ── 2. 备用通道：若推文仍为空，尝试从 article/list 补齐 ──
-    from backend.waterwall import WATERWALL
-    if len(raw_items) == 0 and not WATERWALL.get("active"):
+    if len(raw_items) == 0:
         u_alist = f"https://i.weread.qq.com/article/list?bookId={book_id}&synckey=0"
         resp_alist, h_alist, acc_alist = _do_get(u_alist)
         if resp_alist and resp_alist.status_code == 200:
@@ -349,7 +368,7 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
             has_more = begin + count < len(fallback_items)
 
     # ── 3. 兜底通道：若推文仍为空且为第一页 (begin == 0)，从 mp/cover 获取置顶/最新封面推文 ──
-    if len(raw_items) == 0 and begin == 0 and not WATERWALL.get("active"):
+    if len(raw_items) == 0 and begin == 0:
         u_cov = f"https://i.weread.qq.com/mp/cover?bookId={book_id}"
         resp_cov, h_cov, acc_cov = _do_get(u_cov)
         if resp_cov and resp_cov.status_code == 200:

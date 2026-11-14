@@ -215,7 +215,7 @@ const Router = {
             const cachedPage = this.pageCache[pageKey].page;
             if (cachedPage && typeof cachedPage.onShow === 'function') {
                 try {
-                    cachedPage.onShow();
+                    await cachedPage.onShow(routeParams);
                 } catch (err) {
                     console.error('onShow hook error:', err);
                 }

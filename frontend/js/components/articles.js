@@ -150,6 +150,13 @@ const ArticlesPage = {
         }
     },
 
+    async onShow(params = {}) {
+        await this.loadAccountSelector();
+        if (params.fakeid && params.name) {
+            this.selectAccount(params.fakeid, params.name);
+        }
+    },
+
     destroy() {
         this._listRequestId++;
         if (this._pollTimer) {
@@ -174,7 +181,7 @@ const ArticlesPage = {
             }
 
             container.innerHTML = accounts.map(acc => `
-                <button class="btn btn-secondary btn-sm account-selector-btn"
+                <button class="btn ${acc.fakeid === this.currentFakeid ? 'btn-primary' : 'btn-secondary'} btn-sm account-selector-btn"
                         data-fakeid="${acc.fakeid}"
                         onclick="ArticlesPage.selectAccount('${acc.fakeid}', '${acc.nickname}')">
                     ${acc.nickname}
