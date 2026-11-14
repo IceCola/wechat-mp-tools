@@ -1148,7 +1148,7 @@ def fetch_wechat_article_html(url: str, review_id: str = "") -> tuple[str, str, 
     return "", clean_orig_url, http_error or browser_error or "抓取文章失败"
 
 
-def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redirect_depth: int = 0, review_id: str = "") -> dict:
+def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redirect_depth: int = 0, review_id: str = "", publish_time: int = 0) -> dict:
     """
     下载单篇文章 (具备三级抗风控抓取能力)
 
@@ -1240,7 +1240,12 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         if content_is_empty and _redirect_depth < MAX_REDIRECT_DEPTH:
             original_url = unescape(share_source_match.group(1))
             original_url = clean_wechat_article_url(original_url)
-            return download_single_article(original_url, out_dir, title_hint, _redirect_depth=_redirect_depth + 1)
+            return download_single_article(
+                original_url, out_dir, title_hint,
+                _redirect_depth=_redirect_depth + 1,
+                review_id=review_id,
+                publish_time=publish_time,
+            )
 
     # 提取封面 URL、描述和发布时间
     cover_url = ""
@@ -1270,6 +1275,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         for k, v in replacements.items():
             digest = digest.replace(k, v)
 
+    source_publish_time = int(publish_time or 0)
+    if source_publish_time > 100000000000:
+        source_publish_time //= 1000
     publish_time = 0
     # 提取微信文章中的发布时间戳 ct
     ct_match = re.search(r'\bct\s*=\s*["\']?(\d+)["\']?', raw_html)
@@ -1279,6 +1287,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         pt_match = re.search(r'\bpublish_time\s*=\s*["\']?(\d+)["\']?', raw_html)
         if pt_match:
             publish_time = int(pt_match.group(1))
+    # 微信读书正文可能没有 ct / publish_time，使用文章列表提供的发布日期兜底。
+    if publish_time <= 0:
+        publish_time = source_publish_time
 
     # 从 HTML 提取标题，增加多路 Fallback 兜底（属性顺序无关）
     page_title = ""

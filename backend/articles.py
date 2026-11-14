@@ -1288,7 +1288,10 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
 
             for attempt in range(1, max_retries + 1):
                 try:
-                    result = download_single_article(link, out_dir, title, review_id=review_id)
+                    result = download_single_article(
+                link, out_dir, title, review_id=review_id,
+                publish_time=article.get("update_time") or article.get("publish_time") or 0,
+            )
                     if result.get("success"):
                         success = True
                         break
@@ -1405,7 +1408,10 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
     result = {}
     for attempt in range(1, max_retries + 1):
         try:
-            result = download_single_article(link, out_dir, title, review_id=review_id)
+            result = download_single_article(
+                        link, out_dir, title, review_id=review_id,
+                        publish_time=article.get("update_time") or article.get("publish_time") or 0,
+                    )
             if result.get("success"):
                 success = True
                 break

@@ -116,6 +116,17 @@ class DownloadOptionsTests(unittest.TestCase):
         self.assertEqual(path.name, '测试标题')
         self.assertEqual(json.loads((path / 'metadata.json').read_text())['publish_time'], 0)
 
+    def test_list_publish_time_is_used_when_page_has_no_timestamp(self):
+        self.settings.update(filename_date=True)
+        self.fetch_mock.return_value = (PAGE.replace('var ct = "1792686600";', ''), URL, '')
+        result = downloader.download_single_article(
+            URL, self.root / '账号', '测试标题', publish_time=1792686600
+        )
+        self.assertTrue(result['success'], result.get('error'))
+        path = Path(result['path'])
+        self.assertEqual(path.name, '2026-10-23_测试标题')
+        self.assertEqual(json.loads((path / 'metadata.json').read_text())['publish_time'], 1792686600)
+
     def test_markdown_only_repeated_downloads_never_overwrite(self):
         first = self.download()
         content = (first / '测试标题.md').read_bytes()

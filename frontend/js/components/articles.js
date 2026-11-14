@@ -705,7 +705,10 @@ const ArticlesPage = {
     async downloadSingle(localIdx) {
         const article = this.articles[localIdx];
         if (!article) return;
-        await this.downloadArticles([{ title: article.title, link: article.link, id: article.id, aid: article.id }]);
+        await this.downloadArticles([{
+            title: article.title, link: article.link, id: article.id, aid: article.id,
+            update_time: article.update_time || article.publish_time || 0,
+        }]);
     },
 
     async downloadSelected() {
@@ -713,7 +716,10 @@ const ArticlesPage = {
         this.selectedArticles.forEach(globalIdx => {
             const article = this.loadedArticlesMap.get(globalIdx);
             if (article && article.link) {
-                selectedList.push({ title: article.title, link: article.link, id: article.id, aid: article.id });
+                selectedList.push({
+                    title: article.title, link: article.link, id: article.id, aid: article.id,
+                    update_time: article.update_time || article.publish_time || 0,
+                });
             }
         });
 
